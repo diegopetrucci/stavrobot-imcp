@@ -183,6 +183,90 @@ def _consume_task_result(task: asyncio.Future[Any]) -> None:
             task.exception()
 
 
+class _SessionOwner:
+    """Keep one MCP context's entry and exit in the same asyncio task."""
+
+    def __init__(self, context: Any, *, close_timeout: float) -> None:
+        self.context = context
+        self.close_timeout = close_timeout
+        self.loop = asyncio.get_running_loop()
+        self.ready: asyncio.Future[Any] = self.loop.create_future()
+        self.ready.add_done_callback(_consume_task_result)
+        self.stop_event = asyncio.Event()
+        self.task: asyncio.Task[Any] | None = None
+        self.session: Any | None = None
+        self.entered = False
+        self.exit_error: BaseException | None = None
+
+    def start(self) -> None:
+        if self.task is not None:
+            raise RuntimeError("session owner already started")
+        self.task = asyncio.create_task(self._run(), name="imcp-session-owner")
+        self.task.add_done_callback(_consume_task_result)
+
+    async def wait_ready(self, timeout: float) -> Any:
+        self.start()
+        try:
+            return await _await_bounded(asyncio.shield(self.ready), timeout)
+        except BaseException:
+            await self.close(cancel=True)
+            raise
+
+    async def _run(self) -> None:
+        entered = False
+        try:
+            self.session = await self.context.__aenter__()
+            entered = True
+            self.entered = True
+            if not self.ready.done():
+                self.ready.set_result(self.session)
+            await self.stop_event.wait()
+        except BaseException as exc:
+            if not self.ready.done():
+                if isinstance(exc, asyncio.CancelledError):
+                    self.ready.cancel()
+                else:
+                    self.ready.set_exception(exc)
+            raise
+        finally:
+            if entered:
+                exit_method = getattr(self.context, "__aexit__", None)
+                if callable(exit_method):
+                    try:
+                        await exit_method(None, None, None)
+                    except BaseException as exc:
+                        # Cleanup must not become an unhandled task exception.  The
+                        # owner records it for regression tests and still retires.
+                        self.exit_error = exc
+
+    async def close(self, *, cancel: bool = False) -> None:
+        task = self.task
+        if task is None:
+            return
+        self.stop_event.set()
+        if cancel and not task.done():
+            task.cancel()
+        try:
+            await asyncio.wait_for(asyncio.shield(task), self.close_timeout)
+        except asyncio.TimeoutError:
+            if not task.done():
+                task.cancel()
+                task.add_done_callback(_consume_task_result)
+        except asyncio.CancelledError:
+            # A cancellation raised by the owner itself is cleanup completion;
+            # a cancellation of this caller is propagated after detaching it.
+            if task.cancelled():
+                return
+            if not task.done():
+                task.cancel()
+                task.add_done_callback(_consume_task_result)
+            raise
+        except BaseException:
+            # Context teardown is best effort and bounded; never leak lower
+            # layer exception details through the bridge.
+            _consume_task_result(task)
+
+
 async def _await_bounded(awaitable: Any, timeout: float) -> Any:
     """Await an operation without waiting on cancellation handlers past its bound."""
 
@@ -572,7 +656,7 @@ class BridgeService:
         self._session_factory = session_factory or self._default_session_factory
 
         self._lock = asyncio.Lock()
-        self._session_context: Any | None = None
+        self._session_owner: _SessionOwner | None = None
         self._session: Any | None = None
         self._session_known_dead = False
         # None means no connection attempt has produced app reachability
@@ -606,19 +690,13 @@ class BridgeService:
         return "*" in self._allowlist or name in self._allowlist
 
     async def _close_session_locked(self) -> None:
-        context = self._session_context
-        self._session_context = None
+        owner = self._session_owner
+        self._session_owner = None
         self._session = None
-        if context is None:
-            return
-        exit_method = getattr(context, "__aexit__", None)
-        if not callable(exit_method):
+        if owner is None:
             return
         with suppress(BaseException):
-            await _await_bounded(
-                exit_method(None, None, None),
-                self._close_timeout,
-            )
+            await owner.close()
 
     @staticmethod
     def _bounded_phase_timeout(configured: float, deadline: float | None) -> float:
@@ -653,42 +731,33 @@ class BridgeService:
                     raise
                 candidate = await _await_bounded(candidate, setup_timeout)
             context = candidate if callable(getattr(candidate, "__aenter__", None)) else _SessionOnlyContext(candidate)
+            owner = _SessionOwner(context, close_timeout=self._close_timeout)
+            self._session_owner = owner
         except asyncio.CancelledError:
             raise
         except Exception:
             self._last_app_reachable = False
             raise SessionUnavailableError(app_reachable=False) from None
-        entered = False
+
         try:
             # ``open_imcp_session().__aenter__`` includes Bonjour observation,
             # service-detail resolution, and TCP connect.  Its bound must
             # cover all three phases rather than using connect_timeout alone.
             setup_timeout = self._bounded_phase_timeout(self._setup_timeout, deadline)
-            session = await _await_bounded(context.__aenter__(), setup_timeout)
-            entered = True
-            self._session_context = context
+            session = await owner.wait_ready(setup_timeout)
             self._session = session
             self._last_app_reachable = True
             initialize_timeout = self._bounded_phase_timeout(self._call_timeout, deadline)
             await _await_bounded(session.initialize(), initialize_timeout)
             return session
         except asyncio.CancelledError:
-            self._last_app_reachable = entered
-            if self._session_context is context:
-                await self._close_session_locked()
-            else:
-                with suppress(BaseException):
-                    await _await_bounded(context.__aexit__(None, None, None), self._close_timeout)
+            self._last_app_reachable = owner.entered
+            await self._close_session_locked()
             raise
-        except Exception as exc:
-            self._last_app_reachable = entered
-            if self._session_context is context:
-                await self._close_session_locked()
-            else:
-                with suppress(BaseException):
-                    await _await_bounded(context.__aexit__(None, None, None), self._close_timeout)
-            del exc
-            raise SessionUnavailableError(app_reachable=entered) from None
+        except Exception:
+            self._last_app_reachable = owner.entered
+            await self._close_session_locked()
+            raise SessionUnavailableError(app_reachable=owner.entered) from None
 
     async def _mark_session_dead_locked(self) -> None:
         self._session_known_dead = True

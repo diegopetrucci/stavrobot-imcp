@@ -1,48 +1,111 @@
-# iMCP metadata probe
+# Stavrobot iMCP bridge and plugin
 
-This repository contains a read-only probe for the locally installed iMCP app.
+This repository contains the source for a host-side iMCP bridge and the
+Stavrobot plugin that calls it. It is source and documentation only: preparing
+this checkout does not install the plugin, create a token, start a bridge,
+connect to live iMCP, or verify a Stavrobot deployment.
 
-## Create the Python 3.14 environment
+## Component layout
 
-From the repository root:
+The integration has separate host, plugin, and operator boundaries:
+
+```text
+iMCP app (macOS permissions and manual client approval)
+  -> Bonjour discovery and forced-loopback MCP transport
+  -> bridge/server.py at 127.0.0.1:8766/bridge (authenticated host bridge)
+  -> host.docker.internal:8766/bridge (plugin-runner route)
+  -> plugin/imcp/ (Stavrobot plugin bundle)
+  -> Stavrobot plugin tools and the approved agent
+```
+
+- `bridge/server.py` owns the authenticated HTTP boundary and keeps the
+  discovered iMCP connection on loopback. See [`bridge/README.md`](bridge/README.md)
+  for its request and response contract.
+- `plugin/imcp/` contains the `imcp_list_tools` and `imcp_call` Stavrobot
+  tools. **The contents of `plugin/imcp/` must be the standalone plugin root**:
+  `manifest.json` must be at the root of the published or copied bundle. The
+  monorepo root is not itself an installable plugin URL. See
+  [`plugin/imcp/README.md`](plugin/imcp/README.md).
+- The bridge token, host allowlist, and installed plugin configuration are
+  separate operator-managed configuration. Keep credentials out of this
+  repository, agent chat, command output, and logs.
+
+## Python 3.14 setup and local verification
+
+From the repository root, create the explicit Python 3.14 environment and
+install the pinned dependencies:
 
 ```sh
 python3.14 -m venv .venv
 ./.venv/bin/python -m pip install -r requirements.txt
 ```
 
-The pinned requirements include the official MCP Python SDK and Bonjour
-discovery support.
-
-## Run tests
+Run the local suite with:
 
 ```sh
 ./.venv/bin/python -m pytest -v
 ```
 
-The test suite uses only fake discovery/session objects. It does not start a
-persistent bridge, connect to live iMCP, or invoke an MCP tool.
+The suite includes [`tests/test_bridge_sdk.py`](tests/test_bridge_sdk.py),
+which uses the official MCP Python SDK against a local newline-delimited
+fixture. It verifies initialization and readiness cancellation, setup and
+in-flight cancellation, reconnect after disconnect without replaying a call,
+and idle/in-flight cleanup. These are local fixture checks only; they do not
+start the installed iMCP app, invoke a live iMCP tool, or verify network access
+from Stavrobot `plugin-runner`.
 
-## Host bridge
+## Short operator path
 
-`bridge/server.py` provides the authenticated, host-only HTTP bridge used by
-later plugin setup. It defaults to `127.0.0.1:8766/bridge`; startup requires a
-trusted bearer token file:
+For an approved deployment, use this sequence rather than treating local tests
+as deployment evidence:
+
+1. Read [`DEPLOY.md`](DEPLOY.md), including its safety gates. Select only the
+   required iMCP services and permissions, keep the bridge on
+   `127.0.0.1:8766`, create the protected token and explicit tool allowlist in
+   a trusted host terminal, start the host bridge as directed, and manually
+   approve the first iMCP client connection. Start with an approved read-only
+   operation.
+2. Follow [`plugin/imcp/README.md`](plugin/imcp/README.md), then publish or
+   copy **the contents of `plugin/imcp/` as the standalone plugin root**.
+   Configure its `bridge_url` and `bridge_token` through Stavrobot's trusted
+   settings path. The plugin URL uses `host.docker.internal:8766`;
+   `127.0.0.1` inside `plugin-runner` is the container, not the host.
+3. Follow [DEPLOY.md's plugin-runner reachability checks](DEPLOY.md#6-required-reachability-verification-from-plugin-runner).
+   The authenticated check must run from the actual `plugin-runner` as the
+   dedicated plugin user. Do not widen the host bind to `0.0.0.0` to work
+   around a failed container check, and keep iMCP excluded from every
+   `telegram-group-*` agent.
+
+The operator sequence above is not evidence that installation or live
+verification has occurred. The deployment runbook remains the source of truth
+for manual approvals, secret handling, rollback, and live iMCP/Stavrobot
+verification.
+
+## Host bridge command (operator instruction)
+
+The host bridge is authenticated and host-only. Once the manual prerequisites
+in [`DEPLOY.md`](DEPLOY.md) are complete, run the repository helper from its
+root:
 
 ```sh
-./.venv/bin/python bridge/server.py --token-file ~/.config/imcp-bridge.token
+scripts/start-stavrobot-imcp-bridge
 ```
 
-The bridge accepts JSON `POST` requests with `operation` set to `health`,
-`list_tools`, or `call_tool` (the latter also supplies `name` and an object-valued
-`arguments`). See [`bridge/README.md`](bridge/README.md) for the response
-contract, allowlist file shape, bounds, and no-replay behavior. This command is
-only documentation; no service is started by repository setup or tests.
+The helper requires the protected token at `~/.config/imcp-bridge.token` and a
+non-empty, owner-only allowlist at `~/.config/imcp-bridge-tools.json`. It passes
+both paths with `--token-file` and `--allowlist-file`, and starts the bridge on
+`127.0.0.1:8766/bridge` with the required `--call-timeout 10` setting. It accepts
+JSON `POST` operations for `health`, `list_tools`, and `call_tool`. This command
+is documentation only;
+it was not run as part of authoring this README, and repository setup and tests
+do not start a persistent bridge.
 
-## Manually approved live capture
+## Secondary feature: metadata probe
 
-First enable the desired iMCP services and complete macOS permission prompts.
-Run the following command in the logged-in macOS user session:
+The original read-only metadata probe remains available as a secondary
+feature, separate from the bridge/plugin deployment. After enabling only the
+approved iMCP services and completing any macOS permission prompts, run it in
+the logged-in macOS session:
 
 ```sh
 ./.venv/bin/python scripts/probe_imcp.py --timeout 300
