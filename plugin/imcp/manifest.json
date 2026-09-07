@@ -1,0 +1,16 @@
+{
+  "name": "imcp",
+  "description": "Expose iMCP tools through an authenticated bridge.",
+  "instructions": "Publish or copy the contents of this plugin/imcp source subtree as the root of a dedicated plugin repository, then tell Stavrobot to install <plugin repo URL>. Configure bridge_token through Stavrobot web settings or a trusted host-side secret path; never paste it into agent chat. The token is used only for authentication and is never included in tool responses or errors.",
+  "config": {
+    "bridge_url": {
+      "description": "HTTP URL of the host iMCP bridge.",
+      "required": true,
+      "default": "http://host.docker.internal:8766/bridge"
+    },
+    "bridge_token": {
+      "description": "Bearer token configured for the host iMCP bridge.",
+      "required": true
+    }
+  }
+}
