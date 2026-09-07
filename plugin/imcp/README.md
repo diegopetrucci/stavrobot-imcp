@@ -9,18 +9,19 @@ made available by a host-side iMCP HTTP bridge:
 
 ## Publish and install
 
-The Stavrobot plugin runner expects `manifest.json` at the root of the plugin
-repository. Publish the contents of this `plugin/imcp/` directory as the root
-of a dedicated plugin repository, or copy it there through the later runbook;
-the current monorepo URL is not itself a directly installable plugin URL.
-For the published repository, tell Stavrobot to install `<plugin repo URL>`.
+The public standalone plugin repository is
+`https://github.com/diegopetrucci/stavrobot-imcp-plugin`. Install that URL in
+Stavrobot. The plugin runner expects `manifest.json` at the root of the plugin
+repository. Maintainers must publish the contents of this `plugin/imcp/`
+directory as that standalone repository root; the monorepo URL is not itself a
+directly installable plugin URL.
 
-After installation, configure `bridge_url` and `bridge_token` through
-Stavrobot's web settings or the trusted host-side secret/configuration path.
-Never paste `bridge_token` into agent chat. `config.json.example` documents
-the expected shape for maintainers; the live `config.json` is installation
-configuration and is ignored by git. The default bridge URL is
-`http://host.docker.internal:8766/bridge`.
+After installation, manually prepare the host bridge and configure `bridge_url`
+and `bridge_token` through Stavrobot's web settings or the trusted host-side
+secret/configuration path. Never paste `bridge_token` into agent chat.
+`config.json.example` documents the expected shape for maintainers; the live
+`config.json` is installation configuration and is ignored by git. The default
+bridge URL is `http://host.docker.internal:8766/bridge`.
 
 The tools send the token only as a Bearer credential and never include it in
 output or error messages.

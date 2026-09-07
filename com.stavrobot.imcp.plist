@@ -13,19 +13,7 @@
   <key>ProgramArguments</key>
   <array>
     <string>{{ .chezmoi.homeDir }}/Developer/stavrobot-imcp/.venv/bin/python</string>
-    <string>{{ .chezmoi.homeDir }}/Developer/stavrobot-imcp/bridge/server.py</string>
-    <string>--bind</string>
-    <string>127.0.0.1</string>
-    <string>--port</string>
-    <string>8766</string>
-    <string>--path</string>
-    <string>/bridge</string>
-    <string>--token-file</string>
-    <string>{{ .chezmoi.homeDir }}/.config/imcp-bridge.token</string>
-    <string>--allowlist-file</string>
-    <string>{{ .chezmoi.homeDir }}/.config/imcp-bridge-tools.json</string>
-    <string>--call-timeout</string>
-    <string>10</string>
+    <string>{{ .chezmoi.homeDir }}/Developer/stavrobot-imcp/scripts/run_launchd_bridge.py</string>
   </array>
 
   <key>WorkingDirectory</key>
@@ -48,12 +36,13 @@
   <key>RunAtLoad</key>
   <true/>
 
-  <!--
-    Deliberately do not retry automatically: a port collision would otherwise
-    produce a launchd/log loop. Preflight the fixed port before loading.
-  -->
+  <!-- Restart after exits; preflight never kills a conflicting listener. -->
   <key>KeepAlive</key>
-  <false/>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+  <key>Umask</key>
+  <integer>63</integer>
 
   <key>StandardOutPath</key>
   <string>{{ .chezmoi.homeDir }}/Library/Logs/Stavrobot/imcp-bridge.out.log</string>

@@ -1,9 +1,9 @@
 # iMCP bridge and Stavrobot plugin deployment
 
 This is a **manual operator runbook**. The repository contains source and
-templates only. This task does not create a token, copy files outside the
-repository, change chezmoi, install the plugin, load a LaunchAgent, start a
-bridge, run Docker/OrbStack, or invoke an iMCP tool.
+templates only. Preparing this checkout does not create a token, copy files
+outside the repository, change chezmoi, install the plugin, load a LaunchAgent,
+start a bridge, run Docker/OrbStack, or invoke an iMCP tool.
 
 The bridge exposes an authenticated HTTP boundary for the iMCP services enabled
 by the operator:
@@ -31,11 +31,11 @@ iMCP app (macOS permissions and client approval)
    secret-bearing, and none belongs in source.
 4. Use a trusted host allowlist with explicit iMCP tool names. Although
    `bridge/server.py` defaults to `*` when no allowlist is supplied, deployment
-   through the helper or plist below requires
+   through the helper or LaunchAgent wrapper below requires
    `~/.config/imcp-bridge-tools.json` so least privilege is deliberate.
 5. Keep the timeout ladder intact:
    `15s (bridge) < 20s (plugin client) < 30s (synchronous plugin-runner)`.
-   The helper and plist explicitly pin the bridge's 10-second
+   The helper and LaunchAgent wrapper explicitly pin the bridge's 10-second
    `--call-timeout` default, which yields its 15-second outer deadline. Any
    override must keep the resulting bridge outer deadline strictly below the
    plugin's 20 seconds.
@@ -86,26 +86,39 @@ Stavrobot tool call. Resolve the prompt before the plugin-runner verification.
 ## 2. Create the host token securely (operator action only)
 
 Generate the token in a trusted local terminal, never in agent chat. The
-following example writes the token directly to the protected file and does not
-print it. Preserve an existing token unless a deliberate rotation has been
-approved:
+checkout and an available Python 3 interpreter are prerequisites; the helper
+uses only Python's standard library and creates the configuration directory if
+needed:
 
 ```sh
-token_file="$HOME/.config/imcp-bridge.token"
-if [ ! -s "$token_file" ]; then
-  ( umask 077
-    mkdir -p "${token_file%/*}"
-    python3 -c 'import secrets; print(secrets.token_urlsafe(32))' > "$token_file"
-  )
-fi
-chmod 600 "$token_file"
+cd "$HOME/Developer/stavrobot-imcp"
+./scripts/create_token.sh
 ```
 
-Do not use `cat` on the token in a chat or log, and do not put its value in the
-plist, `config.json.example`, a command transcript, or Git. If rotating it,
-update the host file and the Stavrobot plugin configuration as one approved
-change, then verify the old credential is no longer usable without exposing
-either value.
+The helper writes `~/.config/imcp-bridge.token` without printing its contents,
+uses mode `0600`, and refuses symlink, nonregular, empty, or invalid existing
+token files. Repeating the command preserves an existing valid token and reapplies
+owner-only permissions; it does not rotate or overwrite credentials. If this
+command newly created the token and you need to undo only that creation, first
+confirm it did not exist before the command, then remove it from the trusted
+terminal:
+
+```sh
+rm "$HOME/.config/imcp-bridge.token"
+```
+
+Deleting the token file does not immediately revoke a credential from a
+running bridge: the bridge retains its startup credential in memory until its
+active supervisor is stopped. Stop the tmux supervisor or boot out the
+LaunchAgent before deleting or replacing the token. If the token is deleted
+first, the running bridge remains live; after it exits, the `KeepAlive`
+LaunchAgent cannot pass preflight and retries every 30 seconds, causing
+continued log growth until that job is booted out. Do not use deletion as a
+rotation procedure; an approved rotation must stop the active supervisor,
+update the host file and Stavrobot plugin configuration together, then start
+one supervisor again. Never use `cat` on the token in a chat or log, and do not
+put its value in the plist, `config.json.example`, a command transcript, or
+Git.
 
 Create the separate host allowlist in the same trusted terminal. Use a JSON
 object with only the exact, approved iMCP tool names; never use `*` for a
@@ -131,9 +144,9 @@ Replace those example names with the exact names selected by the operator
 list explicit and excluding every unapproved read or write tool. The start
 helper refuses a missing, empty, unreadable, or group/other-accessible allowlist
 and enforces its owner-only mode; it passes this file with `--allowlist-file` to
-the bridge. The direct plist launches `bridge/server.py` and does not enforce
-file modes itself, so its LaunchAgent workflow requires the explicit operator
-preflight in the LaunchAgent section.
+the bridge. The direct plist invokes `scripts/run_launchd_bridge.py`, whose private
+configuration preflight runs before it execs `bridge/server.py` and enforces
+these file modes.
 The allowlist contains no credential, but keep it owner-only so it cannot be
 silently broadened by another account.
 
@@ -171,60 +184,29 @@ configuration or logs.
 ### 3.1 Trigger the first host-side MCP connection and approve it manually
 
 After the bridge is listening, run this **on the macOS host**, not in
-`plugin-runner`. It sends an authenticated, read-only `list_tools` POST to the
-fixed bridge endpoint. The Python snippet reads the token file internally,
-keeps it in memory, consumes the response without printing it, and prints only
-a generic status. It therefore triggers iMCP's client request for
-`stavrobot-imcp-bridge` without putting the token in a command argument or
+`plugin-runner`. It sends exactly one authenticated, read-only `list_tools`
+POST to the fixed bridge endpoint. The repository helper reads the token file
+internally, keeps it in memory, uses a direct no-proxy/no-redirect HTTP
+connection, bounds the response read, and prints only generic status messages.
+It therefore triggers iMCP's client request for `stavrobot-imcp-bridge` without
+putting the token, response body, or tool metadata in a command argument or
 output:
 
 ```sh
-python3 - <<'PY'
-import json
-from pathlib import Path
-from urllib.error import HTTPError
-from urllib.request import Request, urlopen
-
-try:
-    token = (Path.home() / ".config" / "imcp-bridge.token").read_text(encoding="utf-8").strip()
-    request = Request(
-        "http://127.0.0.1:8766/bridge",
-        data=json.dumps({"operation": "list_tools"}, separators=(",", ":")).encode(),
-        headers={
-            "Accept": "application/json",
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
-    with urlopen(request, timeout=20) as response:
-        status = response.status
-        response.read()
-except HTTPError as error:
-    status = error.code
-    try:
-        error.read()
-    except Exception:
-        pass
-except Exception:
-    raise SystemExit(
-        "host approval request failed; inspect the bridge without printing secrets"
-    )
-
-if status != 200:
-    raise SystemExit("host list_tools request did not complete successfully")
-print("host list_tools request completed; inspect iMCP for manual client approval")
-PY
+cd "$HOME/Developer/stavrobot-imcp"
+./scripts/check_bridge.sh
 ```
 
-Watch iMCP while this command waits and approve the **Connection Request**
-manually. The bridge's 15-second outer deadline is shorter than this client's
-20-second socket timeout. If the first read-only request expires at 15 seconds
-(or reaches the 20-second client timeout), wait for the command to exit and
-rerun the same `list_tools` command after resolving the approval. Rerunning
-this read-only discovery request is safe; do not generalize that retry rule to
-a `call_tool` whose outcome could be unknown. The host command never invokes an
-iMCP tool.
+The helper prints conditional approval guidance before waiting. Watch iMCP
+while this command waits and approve the **Connection Request** only if iMCP
+shows it. If no prompt appears, a successful listing needs no further approval.
+The bridge's 15-second outer deadline is shorter than this client's 20-second
+socket timeout. If the first read-only request expires at 15 seconds (or
+reaches the 20-second client timeout), wait for the command to exit and rerun
+`./scripts/check_bridge.sh` after resolving the approval. Rerunning this
+read-only discovery request is safe; do not generalize that retry rule to a
+`call_tool` whose outcome could be unknown. The helper never invokes an iMCP
+tool and never retries automatically.
 
 The unauthenticated GET in §6.1 is only a route/authentication check. It cannot
 trigger iMCP client approval because the bridge rejects it before opening an
@@ -233,10 +215,15 @@ MCP session.
 ## 4. Copy or publish the plugin source bundle
 
 The source bundle is the contents of `plugin/imcp/`, not the monorepo root. The
-**preferred and supported installation is URL installation**: publish those
-contents as the root of a dedicated plugin repository and tell Stavrobot to
-install that repository URL. The monorepo URL by itself does not have
-`manifest.json` at its root.
+**preferred and supported installation is URL installation** from the public
+standalone repository:
+`https://github.com/diegopetrucci/stavrobot-imcp-plugin`. Its root must contain
+`manifest.json`; the monorepo URL by itself is not an installable plugin URL.
+
+For each release, maintainers must manually sync the reviewed contents of
+`plugin/imcp/` to that standalone repository root and verify the root manifest
+before publishing. Exclude local configuration, caches, and credentials; this
+is publication guidance only and does not automate synchronization.
 
 For a deliberately local installation, an operator may copy the source tree to
 the Stavrobot checkout's plugin data directory. Do not copy the live
@@ -258,7 +245,7 @@ rsync -a \
 A local copy is not complete when `rsync` finishes. It requires a **controlled
 `plugin-runner` restart** so its startup migration creates the dedicated
 `plug_imcp` user and chowns the bundle to that user. This restart is an
-operator action and was not run for this ticket:
+operator action that requires an intentionally available deployment:
 
 ```sh
 cd /path/to/stavrobot
@@ -349,7 +336,7 @@ from the host bridge's iMCP service selection, using the actual IDs and
 A host-only `curl` or a bridge process visible in tmux is not sufficient. The
 following two checks must be run by an operator from the actual Stavrobot
 `plugin-runner` container after its services are intentionally available.
-They were **not** run for this ticket.
+These checks require an intentionally available deployment and are operator-run.
 
 ### 6.1 Check the host gateway and auth boundary
 
@@ -460,81 +447,71 @@ printing credentials, check host-gateway/DNS and local firewall behavior, and
 review the container networking design with an operator. A wider bind would
 make authenticated personal-data tools reachable from unintended interfaces.
 
-## LaunchAgent and chezmoi integration (later operator action)
+## Login startup and crash recovery
 
-`com.stavrobot.imcp.plist` is a secret-free chezmoi template for a direct
-LaunchAgent. It invokes the explicit venv Python and `bridge/server.py`, keeps
-the bind at `127.0.0.1`, and supplies the token and allowlist **file paths**
-only. It does not create the tmux session. The manual tmux helper and this
-direct LaunchAgent are alternative supervisors, not a pair to run together.
+Run from the repository after preparing the private token and allowlist. The
+login-service prerequisite is the already-installed app bundle at
+`/Applications/iMCP.app`; the installer only opens it and does not install or
+copy iMCP:
 
-Chezmoi templating is mandatory for this plist. When importing it into a
-chezmoi source, use `chezmoi add --template` or give the source file an
-explicit `.tmpl` name such as `com.stavrobot.imcp.plist.tmpl`; do not leave the
-source as a plain, non-templated plist. The rendered
-`~/Library/LaunchAgents/com.stavrobot.imcp.plist` must contain concrete home
-paths: literal `{{ ... }}` braces must **never** reach the rendered plist.
-Run `plutil -lint` and check for leftover `{{`/`}}` before any load operation.
+```sh
+./.venv/bin/python scripts/install_login_services.py
+```
 
-If this service is approved for login startup, integrate deliberately with the
-existing chezmoi layout rather than editing a rendered file only:
+The installer validates configuration and port availability, renders the templates,
+and loads two per-user LaunchAgents:
 
-1. Review `chezmoi status` and `chezmoi diff`; reconcile unrelated dirty or
-   drifted state before applying anything.
-2. Add the start helper to the appropriate executable `~/.local/bin` source
-   entry (the existing convention names it
-   `executable_start-stavrobot-imcp-bridge`).
-3. Add this plist through `chezmoi add --template`, or place it in the private
-   LaunchAgents source entry with the explicit `.plist.tmpl` suffix, so
-   `{{ .chezmoi.homeDir }}` is rendered to the current user's home directory.
-4. Keep `~/.config/imcp-bridge.token` and
-   `~/.config/imcp-bridge-tools.json` unmanaged or in an approved encrypted
-   secret store. Never `chezmoi add` either plaintext file and never put a
-   credential in the plist template.
-5. Create the log directory, render the plist, verify no template braces
-   remain, and run `plutil -lint` on the rendered file.
-6. Before loading, stop the other supervisor and run this private-mode
-   preflight. It prints modes/status only, never file contents, and fails
-   unless each file is readable, nonempty, and exactly `0400` or `0600`:
+- `com.stavrobot.imcp-app` opens iMCP at GUI login. Quitting iMCP deliberately
+  leaves it closed until it is reopened or the next login.
+- `com.stavrobot.imcp` runs the bridge through a private-configuration preflight.
+  `KeepAlive=true` restores it after an exit; `ThrottleInterval=30` bounds
+  repeated restarts. Missing/invalid configuration or port conflicts fail with
+  a generic diagnostic; no conflicting process is killed. Because `KeepAlive`
+  remains enabled, a persistent preflight failure is retried every 30 seconds;
+  use `launchctl bootout` to stop the retry loop and prevent continued log
+  growth while repairing the configuration.
 
-   ```sh
-   for file in \
-     "$HOME/.config/imcp-bridge.token" \
-     "$HOME/.config/imcp-bridge-tools.json"; do
-     if [ ! -f "$file" ] || [ ! -r "$file" ] || [ ! -s "$file" ]; then
-       printf 'required bridge configuration is missing or unreadable\n' >&2
-       exit 1
-     fi
-     mode="$(stat -f '%Lp' "$file")" || exit 1
-     case "$mode" in
-       400|600) ;;
-       *)
-         printf 'bridge configuration must be mode 0400 or 0600\n' >&2
-         exit 1
-         ;;
-     esac
-   done
-   printf 'bridge token and allowlist private-mode preflight passed\n'
-   ```
+These services start after login, not before login or FileVault unlock. iMCP's
+existing client trust and macOS permissions still apply. An app that has not
+started yet is handled by the bridge's lazy connection on later requests.
 
-   The direct plist does not enforce this check; the operator must complete it
-   before loading. Also verify the fixed port is free and that the rendered
-   plist contains only `127.0.0.1:8766`.
-7. Choose either the tmux helper or the direct LaunchAgent, never both.
+The installer accepts matching rendered files and leaves already-active jobs
+loaded; it refuses drift rather than overwriting an existing file. Stop an
+existing tmux bridge explicitly before installation. To update installed login
+services, boot out both labels and reconcile their rendered plists first:
 
-The template deliberately sets `KeepAlive` to false. A missing configuration
-or port collision therefore exits once instead of making launchd retry and
-log-loop. This preflight is required before every manual load. Do not change
-`KeepAlive` to true unless a reviewed wrapper handles collisions and applies
-the same preflight; never rely on launchd retries to resolve a fixed-port
-collision.
+```sh
+launchctl bootout "gui/$(id -u)/com.stavrobot.imcp"
+launchctl bootout "gui/$(id -u)/com.stavrobot.imcp-app"
+```
 
-For a later, explicitly approved LaunchAgent action, the operator can use the
-usual per-user `launchctl bootstrap`/`kickstart` flow with label
-`com.stavrobot.imcp`. This task did not render, install, bootstrap, kickstart,
-or unload any agent. Keep stdout/stderr log paths protected and inspect logs
-for operational status only; never paste them into chat if they contain
-request data.
+Use one bridge supervisor, never tmux and launchd together.
+
+Logs are in `~/Library/Logs/Stavrobot/imcp-bridge.{out,err}.log`. The launch job
+uses umask 077. Treat logs as operational data and avoid publishing them.
+
+Chezmoi may manage the two LaunchAgents using explicit `.plist.tmpl` source
+names. The installer renders both templates with the home directory and checks
+the resulting files before loading; if rendering manually, validate both with
+`plutil -lint` first. Scope applies to those two files; do not apply unrelated
+configuration drift. Keep the token and allowlist unmanaged. Runtime source
+and its venv must remain available at `~/Developer/stavrobot-imcp`.
+
+Check the authenticated connection with `./scripts/check_bridge.sh`. A
+successful unauthenticated 401 establishes only HTTP reachability. A successful
+authenticated listing establishes the iMCP session; actual tool access remains
+controlled by the allowlist.
+
+To stop automatic restarts, boot out the bridge job (killing its PID alone
+causes launchd to restart it). Remove/disable both login jobs to undo startup:
+
+```sh
+launchctl bootout "gui/$(id -u)/com.stavrobot.imcp"
+launchctl bootout "gui/$(id -u)/com.stavrobot.imcp-app"
+```
+
+Remove the corresponding managed LaunchAgent files only when uninstalling.
+Keep private credentials unless intentionally removing or rotating them.
 
 ## Rollback and uninstall
 
@@ -552,19 +529,26 @@ Perform rollback in the reverse order, with explicit approval:
    tmux kill-session -t stavrobot-imcp-bridge
    ```
 
-   For a LaunchAgent, use the matching per-user `launchctl bootout` operation
-   for `com.stavrobot.imcp` before removing its rendered plist. Do not kill an
-   unrelated tmux session or listener.
+   For LaunchAgents, use the matching per-user `launchctl bootout` operation
+   for both `com.stavrobot.imcp` and `com.stavrobot.imcp-app` before removing
+   either rendered plist. This bootout is also required to stop a persistent
+   preflight retry loop and its log growth. Do not kill an unrelated tmux
+   session or listener.
 3. Remove or quarantine only the deployed copy at
    `$STAVROBOT_ROOT/data/plugins/imcp/` after preserving any approved audit or
    configuration record. Do not remove `plugin/imcp/` from this source checkout
    as part of deployment rollback.
-4. Remove the rendered LaunchAgent and its chezmoi source entry only after a
-   deliberate `chezmoi diff` review. Do not edit or apply chezmoi as part of
-   this ticket.
-5. After all clients are disabled, remove the host token file using the
-   operator's secure-storage policy, or rotate/revoke it if any copy may remain.
-   Do not print either the old or replacement token.
+4. For chezmoi-managed LaunchAgents, review `chezmoi status` and
+   `chezmoi diff`, then remove or reconcile the corresponding source entries
+   through the deliberate chezmoi workflow before removing rendered files.
+   Do not delete only a managed rendered file, since chezmoi will recreate it;
+   leave unrelated managed state untouched.
+5. After all clients are disabled and the active bridge supervisor has been
+   stopped, remove the host token file using the operator's secure-storage
+   policy, or rotate/revoke it if any copy may remain. Stopping first matters:
+   a running bridge retains its in-memory credential, while deleting first
+   leaves it live until exit and makes a `KeepAlive` LaunchAgent enter
+   preflight retry. Do not print either the old or replacement token.
 6. Optionally disable the selected iMCP services and revoke remembered client
    approval/macOS permissions manually. Leave unrelated existing plugins and
    their credentials untouched.

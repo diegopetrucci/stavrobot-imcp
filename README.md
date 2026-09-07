@@ -56,6 +56,25 @@ from Stavrobot `plugin-runner`.
 
 ## Short operator path
 
+For startup after login and automatic bridge crash recovery, prepare the token
+and allowlist, then run:
+
+```sh
+./.venv/bin/python scripts/install_login_services.py
+```
+
+This installs a bridge LaunchAgent and an iMCP app login LaunchAgent. The
+login-service prerequisite is an already-installed app at
+`/Applications/iMCP.app`; this repository only opens it and does not install
+or copy the app. The bridge restarts after exits with a 30-second throttle.
+The tmux helper (`scripts/start-stavrobot-imcp-bridge`) and the bridge
+LaunchAgent are mutually exclusive supervisors: running both on
+`127.0.0.1:8766` causes port-conflict retries and log growth. Stop one
+supervisor before starting the other. See the login-startup section in
+`DEPLOY.md` for configuration checks and uninstall instructions. After a
+reboot, the Mac must be unlocked and the user logged in; this is not a
+pre-login daemon.
+
 For an approved deployment, use this sequence rather than treating local tests
 as deployment evidence:
 
