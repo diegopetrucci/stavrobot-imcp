@@ -25,7 +25,7 @@ iMCP app (macOS permissions and manual client approval)
   tools. **The contents of `plugin/imcp/` must be the standalone plugin root**:
   `manifest.json` must be at the root of the published or copied bundle. The
   monorepo root is not itself an installable plugin URL. See
-  [`plugin/imcp/README.md`](plugin/imcp/README.md).
+  [`plugin/imcp/MAINTAINING.md`](plugin/imcp/MAINTAINING.md).
 - The bridge token, host allowlist, and installed plugin configuration are
   separate operator-managed configuration. Keep credentials out of this
   repository, agent chat, command output, and logs.
@@ -84,10 +84,10 @@ as deployment evidence:
    a trusted host terminal, start the host bridge as directed, and manually
    approve the first iMCP client connection. Start with an approved read-only
    operation.
-2. Follow [`plugin/imcp/README.md`](plugin/imcp/README.md), then publish or
-   copy **the contents of `plugin/imcp/` as the standalone plugin root**.
-   Configure its `bridge_url` and `bridge_token` through Stavrobot's trusted
-   settings path. The plugin URL uses `host.docker.internal:8766`;
+2. Follow [`plugin/imcp/MAINTAINING.md`](plugin/imcp/MAINTAINING.md), then
+   publish or copy **the contents of `plugin/imcp/` as the standalone plugin
+   root**. Configure its `bridge_url` and `bridge_token` through Stavrobot's
+   trusted settings path. The plugin URL uses `host.docker.internal:8766`;
    `127.0.0.1` inside `plugin-runner` is the container, not the host.
 3. Follow [DEPLOY.md's plugin-runner reachability checks](DEPLOY.md#6-required-reachability-verification-from-plugin-runner).
    The authenticated check must run from the actual `plugin-runner` as the
