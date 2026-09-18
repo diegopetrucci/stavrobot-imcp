@@ -1,14 +1,17 @@
 # Maintaining the iMCP bridge plugin
 
-This file covers maintainer-only information for the `plugin/imcp/` subtree:
-publishing the standalone plugin repository, configuration shape, runner
-compatibility notes, and how to run the tests.
+This file covers maintainer-only information for the iMCP bridge plugin.
+The plugin bundle lives at `plugin/imcp/` in the `stavrobot-imcp` monorepo
+and is published at the root of the
+`https://github.com/diegopetrucci/stavrobot-imcp-plugin` repository.
+It covers publishing the standalone plugin repository, configuration shape,
+runner compatibility notes, and how to run the tests.
 
 ## Publishing the standalone repository
 
 The plugin runner expects `manifest.json` at the root of the plugin repository.
-Maintainers must publish the contents of this `plugin/imcp/` directory as the
-standalone repository root at
+Maintainers must publish the contents of the monorepo's `plugin/imcp/`
+directory as the standalone repository root at
 `https://github.com/diegopetrucci/stavrobot-imcp-plugin`. The monorepo URL is
 not itself a directly installable plugin URL.
 
@@ -38,9 +41,16 @@ timeout is no greater than this total deadline.
 
 ## Running the tests
 
-Tests are isolated from live iMCP access and can be run from the repository
-root with:
+Tests are isolated from live iMCP access.
+
+**In the monorepo** (from the `stavrobot-imcp` root):
 
 ```sh
 ./.venv/bin/python -m pytest -q plugin/imcp/tests
+```
+
+**In the standalone repository** (from its root):
+
+```sh
+python -m pytest -q tests
 ```
