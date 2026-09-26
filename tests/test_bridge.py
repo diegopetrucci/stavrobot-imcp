@@ -5,6 +5,7 @@ import concurrent.futures
 import io
 import json
 import logging
+import signal
 import threading
 import time
 from contextlib import redirect_stderr
@@ -18,8 +19,11 @@ from mcp import MCPError, types
 
 from bridge.server import (
     DEFAULT_CALL_TIMEOUT,
+    DEFAULT_RUNTIME_CLOSE_TIMEOUT,
     DEFAULT_RUNTIME_TIMEOUT,
     DEFAULT_SETUP_TIMEOUT,
+    DEFAULT_SHUTDOWN_TIMEOUT,
+    MAX_CALL_TIMEOUT,
     MAX_REQUEST_BODY_BYTES,
     MAX_RESPONSE_BYTES,
     AsyncBridgeRuntime,
@@ -28,6 +32,7 @@ from bridge.server import (
     BridgeRequestHandler,
     BridgeService,
     LOGGER,
+    _SessionOwner,
     _configure_logging,
     load_allowlist,
     load_token,
@@ -201,21 +206,19 @@ def test_allowlist_rejection_happens_before_dispatch() -> None:
     assert created == 0
 
 
-def test_cold_setup_bound_covers_two_discovery_windows_and_connect() -> None:
+def test_cold_setup_bound_covers_stdio_startup() -> None:
     class SlowContext(FakeSessionContext):
         async def __aenter__(self) -> FakeSession:
             await asyncio.sleep(setup_delay)
             return await super().__aenter__()
 
-    discovery_timeout = 0.03
-    connect_timeout = 0.03
-    setup_delay = (discovery_timeout * 2) + connect_timeout - 0.01
+    startup_timeout = 0.03
+    setup_delay = startup_timeout - 0.01
     context = SlowContext(FakeSession())
     service = BridgeService(
         session_factory=lambda: context,
         call_timeout=0.2,
-        discovery_timeout=discovery_timeout,
-        connect_timeout=connect_timeout,
+        startup_timeout=startup_timeout,
     )
 
     server, runtime, thread = start_http(service)
@@ -230,15 +233,12 @@ def test_cold_setup_bound_covers_two_discovery_windows_and_connect() -> None:
     assert status == 200
     assert payload["ok"] is True
     assert context.entered == 1
-    assert service._setup_timeout == pytest.approx(
-        discovery_timeout * 2 + connect_timeout
-    )
+    assert service._setup_timeout == pytest.approx(startup_timeout)
 
 
 def test_cold_setup_timeout_can_be_configured_separately() -> None:
     service = BridgeService(
-        discovery_timeout=0.01,
-        connect_timeout=0.01,
+        startup_timeout=0.01,
         setup_timeout=0.5,
     )
 
@@ -417,7 +417,7 @@ def test_per_call_timeout_returns_unknown_without_replay() -> None:
     assert time.monotonic() - started < 0.5
 
 
-def test_dead_session_is_not_retried_and_next_call_rediscoveries() -> None:
+def test_dead_session_is_not_retried_and_next_call_reconnects() -> None:
     first = FakeSession(call_results=[MCPError(types.CONNECTION_CLOSED, "closed")])
     second = FakeSession(tool_text="fresh-session")
     contexts = [FakeSessionContext(first), FakeSessionContext(second)]
@@ -648,6 +648,119 @@ def test_health_is_nonblocking_during_an_inflight_mcp_call() -> None:
     run(scenario())
 
 
+@pytest.mark.parametrize("operation", ["call_tool", "list_tools"])
+def test_shutdown_during_initialize_skips_tool_dispatch(operation: str) -> None:
+    async def scenario() -> None:
+        initialize_started = asyncio.Event()
+        release_initialize = asyncio.Event()
+
+        class InitializingSession(FakeSession):
+            async def initialize(self) -> None:
+                self.initialize_calls += 1
+                initialize_started.set()
+                await release_initialize.wait()
+
+        session = InitializingSession()
+        context = FakeSessionContext(session)
+        service = BridgeService(session_factory=lambda: context)
+        request = (
+            {"operation": "call_tool", "name": "during_shutdown", "arguments": {}}
+            if operation == "call_tool"
+            else {"operation": "list_tools"}
+        )
+        request_task = asyncio.create_task(service.execute(request), name=f"{operation}-during-initialize")
+        await asyncio.wait_for(initialize_started.wait(), timeout=1.0)
+
+        close_task = asyncio.create_task(service.close(), name="initialize-shutdown")
+        while not service._closing:
+            await asyncio.sleep(0)
+        release_initialize.set()
+
+        response = await asyncio.wait_for(request_task, timeout=1.0)
+        await asyncio.wait_for(close_task, timeout=1.0)
+
+        assert response.status_code == 503
+        assert response.payload["error"]["code"] == "mcp_unavailable"
+        assert response.payload["error"]["app_reachable"] is True
+        assert session.initialize_calls == 1
+        assert session.call_calls == []
+        assert session.list_calls == 0
+        assert context.entered == 1
+        assert context.exited == 1
+        assert service._session_owner is None
+
+    run(scenario())
+
+
+def test_session_owner_applies_pending_cold_retirement_before_start() -> None:
+    async def scenario() -> None:
+        class Context:
+            def __init__(self) -> None:
+                self.entered = 0
+                self.exited = 0
+
+            async def __aenter__(self) -> object:
+                self.entered += 1
+                return object()
+
+            async def __aexit__(self, _exc_type: Any, _exc_value: Any, _traceback: Any) -> None:
+                self.exited += 1
+
+        context = Context()
+        owner = _SessionOwner(context, shutdown_timeout=1.0)
+        deadline = asyncio.get_running_loop().time() + 1.0
+        owner.request_close(deadline=deadline, cancel_cold=True, stop_entered=False)
+        owner.start()
+
+        assert owner.task is not None
+        assert await asyncio.wait_for(owner.close(deadline=deadline), timeout=1.0)
+        assert owner.task.done()
+        assert owner.task.cancelled()
+        assert context.entered == 0
+        assert context.exited == 0
+
+    run(scenario())
+
+
+def test_owner_created_while_closing_is_retired_before_context_entry() -> None:
+    async def scenario() -> None:
+        factory_started = asyncio.Event()
+        release_factory = asyncio.Event()
+        context = FakeSessionContext(FakeSession())
+        factory_calls = 0
+
+        async def factory() -> FakeSessionContext:
+            nonlocal factory_calls
+            factory_calls += 1
+            factory_started.set()
+            await release_factory.wait()
+            return context
+
+        service = BridgeService(session_factory=factory, setup_timeout=1.0)
+        request_task = asyncio.create_task(
+            service.execute({"operation": "call_tool", "name": "during_shutdown", "arguments": {}}),
+            name="owner-created-while-closing",
+        )
+        await asyncio.wait_for(factory_started.wait(), timeout=1.0)
+        close_task = asyncio.create_task(service.close(), name="owner-creation-shutdown")
+        while not service._closing:
+            await asyncio.sleep(0)
+        release_factory.set()
+
+        response = await asyncio.wait_for(request_task, timeout=1.0)
+        await asyncio.wait_for(close_task, timeout=1.0)
+
+        assert response.status_code == 503
+        assert response.payload["error"]["code"] == "mcp_unavailable"
+        assert response.payload["error"]["app_reachable"] is False
+        assert factory_calls == 1
+        assert context.entered == 0
+        assert context.exited == 0
+        assert service._session_owner is None
+
+    run(scenario())
+
+
 def test_health_reports_false_after_transport_evidence() -> None:
     session = FakeSession(call_results=[MCPError(types.CONNECTION_CLOSED, "closed")])
     service = BridgeService(session_factory=lambda: FakeSessionContext(session))
@@ -660,7 +773,12 @@ def test_health_reports_false_after_transport_evidence() -> None:
     assert health.payload["result"]["imcp_app_reachable"] is False
 
 
-def test_default_factory_reconnects_with_fresh_transport_options() -> None:
+def test_bridge_rejects_shutdown_timeout_shorter_than_stdio_escalation() -> None:
+    with pytest.raises(BridgeConfigurationError, match="at least"):
+        BridgeService(shutdown_timeout=0.25)
+
+
+def test_default_factory_reconnects_with_fresh_stdio_options() -> None:
     first = FakeSession(call_results=[MCPError(types.CONNECTION_CLOSED, "closed")])
     second = FakeSession(tool_text="second-session")
     contexts = [FakeSessionContext(first), FakeSessionContext(second)]
@@ -670,7 +788,11 @@ def test_default_factory_reconnects_with_fresh_transport_options() -> None:
         opened.append(kwargs)
         return contexts[len(opened) - 1]
 
-    service = BridgeService(call_timeout=0.25, discovery_timeout=0.3, connect_timeout=0.4, close_timeout=0.5)
+    service = BridgeService(
+        call_timeout=0.25,
+        startup_timeout=0.3,
+        shutdown_timeout=DEFAULT_SHUTDOWN_TIMEOUT,
+    )
     with patch("bridge.server.open_imcp_session", side_effect=fake_open):
         first_response = run(
             service.execute({"operation": "call_tool", "name": "once", "arguments": {}})
@@ -683,9 +805,9 @@ def test_default_factory_reconnects_with_fresh_transport_options() -> None:
     assert second_response.payload["ok"] is True
     assert len(opened) == 2
     for options in opened:
-        assert options["discovery_timeout"] == 0.3
-        assert options["connect_timeout"] == 0.4
-        assert options["close_timeout"] == 0.5
+        assert options["startup_timeout"] == 0.3
+        assert options["shutdown_timeout"] == DEFAULT_SHUTDOWN_TIMEOUT
+        assert options["read_timeout_seconds"] == 0.25
     assert len(first.call_calls) == 1
     assert len(second.call_calls) == 1
 
@@ -869,6 +991,38 @@ def test_http_generic_call_runtime_failure_is_unknown() -> None:
     assert payload["error"]["retryable"] is False
 
 
+def test_runtime_close_budget_stays_below_launchd_exit_window() -> None:
+    assert DEFAULT_RUNTIME_CLOSE_TIMEOUT < 20.0
+    assert DEFAULT_RUNTIME_CLOSE_TIMEOUT > DEFAULT_SHUTDOWN_TIMEOUT * 2 + 1.0
+
+
+def test_call_timeout_ceiling_preserves_runtime_shutdown_budget() -> None:
+    assert DEFAULT_CALL_TIMEOUT < MAX_CALL_TIMEOUT
+    with pytest.raises(BridgeConfigurationError, match="runtime close budget"):
+        BridgeService(call_timeout=MAX_CALL_TIMEOUT)
+
+    boundary_service = BridgeService(call_timeout=MAX_CALL_TIMEOUT - 0.01)
+    assert boundary_service._call_timeout == pytest.approx(MAX_CALL_TIMEOUT - 0.01)
+
+
+def test_runtime_close_after_worker_loop_ended_completes_bookkeeping() -> None:
+    runtime = AsyncBridgeRuntime(BridgeService())
+    runtime.start()
+    runtime.loop.call_soon_threadsafe(runtime.loop.stop)
+    runtime._thread.join(timeout=2)
+
+    assert runtime.loop.is_closed()
+    assert not runtime._thread.is_alive()
+
+    runtime.close()
+    runtime.close()
+
+    assert runtime._closed
+    assert runtime._closed_event.is_set()
+    assert runtime.loop.is_closed()
+    assert not runtime._thread.is_alive()
+
+
 def test_runtime_immediate_close_closes_unstarted_loop() -> None:
     runtime = AsyncBridgeRuntime(BridgeService())
 
@@ -965,6 +1119,57 @@ def test_token_and_allowlist_configuration_validation(tmp_path: Path) -> None:
         load_allowlist(invalid)
 
 
+def test_main_routes_sigterm_through_runtime_close_without_signaling_parent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    token = tmp_path / "token"
+    token.write_text("secret-token\n", encoding="utf-8")
+    signal_handlers: list[Any] = []
+    signal_calls: list[tuple[int, Any]] = []
+    runtime_instances: list[Any] = []
+
+    class FakeRuntime:
+        def __init__(self, _service: BridgeService) -> None:
+            self.closed = False
+            runtime_instances.append(self)
+
+        def start(self) -> None:
+            return None
+
+        def close(self) -> None:
+            self.closed = True
+            assert signal_calls[1] == (signal.SIGTERM, signal.SIG_IGN)
+
+    class FakeServer:
+        def __init__(self, *_args: Any, runtime: FakeRuntime, **_kwargs: Any) -> None:
+            self.runtime = runtime
+
+        def serve_forever(self) -> None:
+            assert signal_handlers
+            signal_handlers[0](signal.SIGTERM, None)
+
+        def server_close(self) -> None:
+            return None
+
+    def fake_signal(signum: int, handler: Any) -> Any:
+        signal_calls.append((signum, handler))
+        if signum == signal.SIGTERM and not signal_handlers:
+            signal_handlers.append(handler)
+        return signal.SIG_DFL
+
+    monkeypatch.setattr("bridge.server.AsyncBridgeRuntime", FakeRuntime)
+    monkeypatch.setattr("bridge.server.BridgeHTTPServer", FakeServer)
+    monkeypatch.setattr("bridge.server._configure_logging", lambda: None)
+    monkeypatch.setattr("bridge.server.signal.signal", fake_signal)
+
+    assert main(["--token-file", str(token), "--allow-tool", "safe_tool"]) == 0
+    assert len(runtime_instances) == 1
+    assert runtime_instances[0].closed
+    assert signal_calls[0][0] == signal.SIGTERM
+    assert signal_calls[-1][0] == signal.SIGTERM
+
+
 def test_main_isolates_bridge_logging_from_root_and_third_party_records(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -976,7 +1181,7 @@ def test_main_isolates_bridge_logging_from_root_and_third_party_records(
     original_bridge_handlers = list(LOGGER.handlers)
     original_bridge_level = LOGGER.level
     original_bridge_propagate = LOGGER.propagate
-    third_party_loggers = [logging.getLogger(name) for name in ("mcp", "zeroconf", "asyncio")]
+    third_party_loggers = [logging.getLogger(name) for name in ("mcp", "asyncio")]
     original_third_party_state = [
         (list(logger.handlers), logger.level, logger.propagate, logger.disabled) for logger in third_party_loggers
     ]
@@ -1016,7 +1221,6 @@ def test_main_isolates_bridge_logging_from_root_and_third_party_records(
 
             LOGGER.info("tool=safe_tool status=ok duration_ms=7")
             logging.getLogger("mcp").info("mcp INFO payload=private")
-            logging.getLogger("zeroconf").warning("zeroconf WARNING host=private")
             logging.getLogger("asyncio").error("asyncio ERROR payload=private")
             fallback_logger.error("lastResort payload=private")
 
@@ -1024,7 +1228,6 @@ def test_main_isolates_bridge_logging_from_root_and_third_party_records(
         messages = output.getvalue()
         assert "tool=safe_tool status=ok duration_ms=7" in messages
         assert "mcp INFO payload=private" not in messages
-        assert "zeroconf WARNING host=private" not in messages
         assert "asyncio ERROR payload=private" not in messages
         assert "lastResort payload=private" not in messages
     finally:

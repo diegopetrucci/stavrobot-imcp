@@ -7,6 +7,37 @@ and is published at the root of the
 It covers publishing the standalone plugin repository, configuration shape,
 runner compatibility notes, and how to run the tests.
 
+## Host transport compatibility
+
+The host bridge requires iMCP **1.5.1 or newer** and launches the app's bundled
+`Contents/MacOS/imcp-server` through the official MCP SDK stdio client. The
+plugin runner never launches that process and does not speak stdio; it continues
+to use the authenticated HTTP `POST` contract at `bridge_url` with its Bearer
+token, JSON operation names, response envelope, and `truncated` behavior.
+Transport migration must not change that plugin-facing contract.
+
+The first bridge-side session may cause iMCP to show a **Connection Request**
+for `stavrobot-imcp-bridge`; an operator must review and approve it manually.
+A remembered approval may make later launches prompt-free. The bridge keeps a
+session after first use and reconnects lazily by launching a fresh stdio child.
+It never replays a `call_tool` whose dispatch or result is uncertain; such a
+failure is returned as `unknown_outcome`. Only a read-only `list_tools` request
+may be retried after approval or startup recovery. The timeout ladder remains
+15 seconds for the bridge, 20 seconds for this HTTP client, and 30 seconds for
+the synchronous plugin-runner. The bridge's `--call-timeout` is 10 seconds by
+default and must stay strictly below 11 seconds: the 18-second runtime-close
+budget must retain the 7-second minimum stdio teardown floor
+(`call timeout + shutdown timeout < 18s`).
+
+If the migration must be rolled back, deploy the prior repository revision as a
+complete unit, including its prior custom TCP transport and matching
+requirements. Keep the plugin HTTP configuration unchanged. The deployment
+runbook is maintained in the monorepo; its rollback procedure is available at
+[`DEPLOY.md`](https://github.com/diegopetrucci/stavrobot-imcp/blob/main/DEPLOY.md#stdio-transport-migration-and-rollback).
+Use that canonical procedure whether this file is read at
+`plugin/imcp/MAINTAINING.md` in the monorepo or at `MAINTAINING.md` in the
+standalone repository root.
+
 ## Publishing the standalone repository
 
 The plugin runner expects `manifest.json` at the root of the plugin repository.

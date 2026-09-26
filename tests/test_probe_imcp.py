@@ -8,7 +8,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from mcp import types
 
@@ -104,6 +104,10 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
             [None, types.PaginatedRequestParams(cursor="next")],
         )
         open_session.assert_called_once()
+        self.assertEqual(
+            open_session.call_args.kwargs["server_path"],
+            probe_imcp.APP_PATH / "Contents" / "MacOS" / "imcp-server",
+        )
         client_info = open_session.call_args.kwargs["client_info"]
         self.assertEqual(client_info.name, "imcp-tools-probe")
         self.assertEqual(client_info.version, probe_imcp.CLIENT_VERSION)
@@ -123,6 +127,48 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
                 },
             ],
         )
+
+    async def test_lists_tools_from_custom_app_bundle(self) -> None:
+        fake_session = _FakeSession()
+        custom_app = Path("/alternate/iMCP.app")
+
+        with patch.object(
+            probe_imcp,
+            "open_imcp_session",
+            return_value=_FakeSessionContext(fake_session),
+        ) as open_session:
+            await probe_imcp._list_all_tools(custom_app)
+
+        open_session.assert_called_once()
+        self.assertEqual(
+            open_session.call_args.kwargs["server_path"],
+            custom_app / "Contents" / "MacOS" / "imcp-server",
+        )
+
+    async def test_run_forwards_custom_app_to_tool_listing(self) -> None:
+        custom_app = Path("/alternate/iMCP.app")
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            args = argparse.Namespace(
+                app=custom_app,
+                output=Path(temporary_directory) / "metadata.md",
+                app_version="1.4.1",
+                capture_date="2026-09-07",
+                timeout=1.0,
+            )
+            with (
+                patch.object(probe_imcp, "_launch_app_if_needed") as launch_app,
+                patch.object(
+                    probe_imcp,
+                    "_list_all_tools",
+                    new_callable=AsyncMock,
+                    return_value=[],
+                ) as list_all_tools,
+            ):
+                await probe_imcp._run(args)
+
+        launch_app.assert_called_once_with(custom_app)
+        list_all_tools.assert_awaited_once_with(custom_app)
 
     def test_missing_app_is_a_friendly_failure(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -182,7 +228,7 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
             timeout=1.0,
         )
 
-        async def fail_listing() -> list[dict[str, object]]:
+        async def fail_listing(_app_path: Path) -> list[dict[str, object]]:
             raise RuntimeError("transport unavailable")
 
         stderr = io.StringIO()
@@ -247,7 +293,9 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
             "is documented below; this is not a record of the operator's Mac configuration.",
             rendered,
         )
-        self.assertIn("No tool was invoked", rendered)
+        self.assertIn("Supported deployments require iMCP **>=1.5.1**", rendered)
+        self.assertIn("bundled `imcp-server` over stdio", rendered)
+        self.assertIn("no tool is invoked", rendered)
 
 
 if __name__ == "__main__":

@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Capture iMCP's read-only MCP tool metadata.
 
-This probe initializes an MCP client over iMCP's shared Bonjour/loopback
-transport and requests only ``tools/list``. It never calls an MCP tool, and
-writes only each tool's name, description, and input schema to the output
-document.
+This probe initializes an MCP client through iMCP's bundled stdio server and
+requests only ``tools/list``. It never calls an MCP tool, and writes only each
+tool's name, description, and input schema to the output document.
 """
 
 from __future__ import annotations
@@ -31,7 +30,9 @@ from stavrobot_imcp import open_imcp_session
 
 
 APP_PATH = Path("/Applications/iMCP.app")
-APP_VERSION = "1.4.1"
+# The bundled imcp-server is supported from iMCP 1.5.1 onward. Operators can
+# pass the installed version explicitly when recording a metadata snapshot.
+APP_VERSION = "1.5.1"
 CLIENT_NAME = "imcp-tools-probe"
 CLIENT_VERSION = "1.0.0"
 DEFAULT_TIMEOUT = 300.0
@@ -62,10 +63,14 @@ def _launch_app_if_needed(app_path: Path) -> None:
     except (OSError, subprocess.SubprocessError) as exc:
         raise RuntimeError(f"could not open iMCP app: {app_path}") from exc
 
-    # Give the menu-bar app a moment to register its local server before the
-    # Bonjour discovery starts. Permission and approval prompts remain manual
-    # UI actions; this probe does not interact with them.
+    # Give the menu-bar app a moment to be ready before the bundled server
+    # starts. Permission and approval prompts remain manual UI actions; this
+    # probe does not interact with them.
     time.sleep(2)
+
+
+def _bundled_server_path(app_path: Path) -> Path:
+    return app_path / "Contents" / "MacOS" / "imcp-server"
 
 
 def _metadata_for_tool(tool: types.Tool) -> dict[str, Any]:
@@ -80,8 +85,9 @@ def _metadata_for_tool(tool: types.Tool) -> dict[str, Any]:
     }
 
 
-async def _list_all_tools() -> list[dict[str, Any]]:
+async def _list_all_tools(app_path: Path = APP_PATH) -> list[dict[str, Any]]:
     async with open_imcp_session(
+        server_path=_bundled_server_path(app_path),
         client_info=types.Implementation(
             name=CLIENT_NAME,
             version=CLIENT_VERSION,
@@ -124,7 +130,7 @@ Captured from iMCP **{app_version}** on **{capture_date}** using a read-only MCP
 
 The generic full iMCP {app_version} tool surface when all services are enabled is documented below; this is not a record of the operator's Mac configuration.
 
-Only tool names, descriptions, and input schemas are recorded below. No tool was invoked and no tool result or personal data was captured.
+Supported deployments require iMCP **>=1.5.1**. This probe launches the app's bundled `imcp-server` over stdio and records only tool names, descriptions, and input schemas; no tool is invoked and no tool result or personal data is captured.
 
 ```json
 {payload}
@@ -150,7 +156,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--app-version",
         default=APP_VERSION,
-        help="installed iMCP version to record",
+        help="installed iMCP version to record (supported versions are >=1.5.1)",
     )
     parser.add_argument(
         "--capture-date",
@@ -171,7 +177,7 @@ async def _run(args: argparse.Namespace) -> None:
 
     try:
         tools = await asyncio.wait_for(
-            _list_all_tools(),
+            _list_all_tools(args.app),
             timeout=args.timeout,
         )
     except asyncio.TimeoutError as exc:

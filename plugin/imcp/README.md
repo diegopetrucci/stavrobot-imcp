@@ -4,9 +4,13 @@ Connects Stavrobot to [iMCP](https://github.com/mattt/iMCP), exposing macOS-nati
 
 ## Prerequisites
 
-- A Mac running the iMCP app with the services you want enabled.
+- A Mac running iMCP **1.5.1 or newer**, with the bundled
+  `Contents/MacOS/imcp-server` executable and the services you want enabled.
 - The host iMCP bridge running and reachable from the Stavrobot plugin-runner (the operator prepares this on the host before installing the plugin).
 - A bridge token and tool allowlist created on that host.
+
+The host bridge uses the bundled stdio server; the plugin continues to use its
+authenticated HTTP contract and does not connect to iMCP directly.
 
 ## Install
 
