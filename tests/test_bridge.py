@@ -32,6 +32,7 @@ from bridge.server import (
     BridgeRequestHandler,
     BridgeService,
     LOGGER,
+    _SessionOwner,
     _configure_logging,
     load_allowlist,
     load_token,
@@ -647,6 +648,119 @@ def test_health_is_nonblocking_during_an_inflight_mcp_call() -> None:
     run(scenario())
 
 
+@pytest.mark.parametrize("operation", ["call_tool", "list_tools"])
+def test_shutdown_during_initialize_skips_tool_dispatch(operation: str) -> None:
+    async def scenario() -> None:
+        initialize_started = asyncio.Event()
+        release_initialize = asyncio.Event()
+
+        class InitializingSession(FakeSession):
+            async def initialize(self) -> None:
+                self.initialize_calls += 1
+                initialize_started.set()
+                await release_initialize.wait()
+
+        session = InitializingSession()
+        context = FakeSessionContext(session)
+        service = BridgeService(session_factory=lambda: context)
+        request = (
+            {"operation": "call_tool", "name": "during_shutdown", "arguments": {}}
+            if operation == "call_tool"
+            else {"operation": "list_tools"}
+        )
+        request_task = asyncio.create_task(service.execute(request), name=f"{operation}-during-initialize")
+        await asyncio.wait_for(initialize_started.wait(), timeout=1.0)
+
+        close_task = asyncio.create_task(service.close(), name="initialize-shutdown")
+        while not service._closing:
+            await asyncio.sleep(0)
+        release_initialize.set()
+
+        response = await asyncio.wait_for(request_task, timeout=1.0)
+        await asyncio.wait_for(close_task, timeout=1.0)
+
+        assert response.status_code == 503
+        assert response.payload["error"]["code"] == "mcp_unavailable"
+        assert response.payload["error"]["app_reachable"] is True
+        assert session.initialize_calls == 1
+        assert session.call_calls == []
+        assert session.list_calls == 0
+        assert context.entered == 1
+        assert context.exited == 1
+        assert service._session_owner is None
+
+    run(scenario())
+
+
+def test_session_owner_applies_pending_cold_retirement_before_start() -> None:
+    async def scenario() -> None:
+        class Context:
+            def __init__(self) -> None:
+                self.entered = 0
+                self.exited = 0
+
+            async def __aenter__(self) -> object:
+                self.entered += 1
+                return object()
+
+            async def __aexit__(self, _exc_type: Any, _exc_value: Any, _traceback: Any) -> None:
+                self.exited += 1
+
+        context = Context()
+        owner = _SessionOwner(context, shutdown_timeout=1.0)
+        deadline = asyncio.get_running_loop().time() + 1.0
+        owner.request_close(deadline=deadline, cancel_cold=True, stop_entered=False)
+        owner.start()
+
+        assert owner.task is not None
+        assert await asyncio.wait_for(owner.close(deadline=deadline), timeout=1.0)
+        assert owner.task.done()
+        assert owner.task.cancelled()
+        assert context.entered == 0
+        assert context.exited == 0
+
+    run(scenario())
+
+
+def test_owner_created_while_closing_is_retired_before_context_entry() -> None:
+    async def scenario() -> None:
+        factory_started = asyncio.Event()
+        release_factory = asyncio.Event()
+        context = FakeSessionContext(FakeSession())
+        factory_calls = 0
+
+        async def factory() -> FakeSessionContext:
+            nonlocal factory_calls
+            factory_calls += 1
+            factory_started.set()
+            await release_factory.wait()
+            return context
+
+        service = BridgeService(session_factory=factory, setup_timeout=1.0)
+        request_task = asyncio.create_task(
+            service.execute({"operation": "call_tool", "name": "during_shutdown", "arguments": {}}),
+            name="owner-created-while-closing",
+        )
+        await asyncio.wait_for(factory_started.wait(), timeout=1.0)
+        close_task = asyncio.create_task(service.close(), name="owner-creation-shutdown")
+        while not service._closing:
+            await asyncio.sleep(0)
+        release_factory.set()
+
+        response = await asyncio.wait_for(request_task, timeout=1.0)
+        await asyncio.wait_for(close_task, timeout=1.0)
+
+        assert response.status_code == 503
+        assert response.payload["error"]["code"] == "mcp_unavailable"
+        assert response.payload["error"]["app_reachable"] is False
+        assert factory_calls == 1
+        assert context.entered == 0
+        assert context.exited == 0
+        assert service._session_owner is None
+
+    run(scenario())
+
+
 def test_health_reports_false_after_transport_evidence() -> None:
     session = FakeSession(call_results=[MCPError(types.CONNECTION_CLOSED, "closed")])
     service = BridgeService(session_factory=lambda: FakeSessionContext(session))
@@ -889,6 +1003,24 @@ def test_call_timeout_ceiling_preserves_runtime_shutdown_budget() -> None:
 
     boundary_service = BridgeService(call_timeout=MAX_CALL_TIMEOUT - 0.01)
     assert boundary_service._call_timeout == pytest.approx(MAX_CALL_TIMEOUT - 0.01)
+
+
+def test_runtime_close_after_worker_loop_ended_completes_bookkeeping() -> None:
+    runtime = AsyncBridgeRuntime(BridgeService())
+    runtime.start()
+    runtime.loop.call_soon_threadsafe(runtime.loop.stop)
+    runtime._thread.join(timeout=2)
+
+    assert runtime.loop.is_closed()
+    assert not runtime._thread.is_alive()
+
+    runtime.close()
+    runtime.close()
+
+    assert runtime._closed
+    assert runtime._closed_event.is_set()
+    assert runtime.loop.is_closed()
+    assert not runtime._thread.is_alive()
 
 
 def test_runtime_immediate_close_closes_unstarted_loop() -> None:

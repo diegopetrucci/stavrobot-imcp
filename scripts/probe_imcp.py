@@ -69,6 +69,10 @@ def _launch_app_if_needed(app_path: Path) -> None:
     time.sleep(2)
 
 
+def _bundled_server_path(app_path: Path) -> Path:
+    return app_path / "Contents" / "MacOS" / "imcp-server"
+
+
 def _metadata_for_tool(tool: types.Tool) -> dict[str, Any]:
     """Keep only the fields explicitly allowed in the capture."""
 
@@ -81,8 +85,9 @@ def _metadata_for_tool(tool: types.Tool) -> dict[str, Any]:
     }
 
 
-async def _list_all_tools() -> list[dict[str, Any]]:
+async def _list_all_tools(app_path: Path = APP_PATH) -> list[dict[str, Any]]:
     async with open_imcp_session(
+        server_path=_bundled_server_path(app_path),
         client_info=types.Implementation(
             name=CLIENT_NAME,
             version=CLIENT_VERSION,
@@ -172,7 +177,7 @@ async def _run(args: argparse.Namespace) -> None:
 
     try:
         tools = await asyncio.wait_for(
-            _list_all_tools(),
+            _list_all_tools(args.app),
             timeout=args.timeout,
         )
     except asyncio.TimeoutError as exc:

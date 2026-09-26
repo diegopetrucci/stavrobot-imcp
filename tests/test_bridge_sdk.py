@@ -5,6 +5,8 @@ import json
 import os
 import sys
 import tempfile
+import threading
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -12,7 +14,7 @@ from typing import Any, Awaitable, Callable
 import pytest
 from mcp import ClientSession
 
-from bridge.server import AsyncBridgeRuntime, BridgeService
+from bridge.server import DEFAULT_RUNTIME_CLOSE_TIMEOUT, AsyncBridgeRuntime, BridgeService
 from stavrobot_imcp.transport import open_imcp_session
 
 
@@ -438,6 +440,184 @@ def test_real_sdk_runtime_shutdown_with_concurrent_close_callers_retires_queued_
             if not runtime._closed:
                 await asyncio.to_thread(runtime.close)
             await close_fixture(fixture)
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("operation", ["call_tool", "list_tools"])
+def test_real_sdk_shutdown_during_stalled_cold_startup_skips_later_phases(operation: str) -> None:
+    async def scenario() -> None:
+        fixture = FixtureMCPServer(ignore_stdin_eof=True)
+        server_path = await fixture.start()
+        startup_started = threading.Event()
+
+        @asynccontextmanager
+        async def slow_context() -> Any:
+            async with open_imcp_session(
+                server_path=server_path,
+                read_timeout_seconds=2.0,
+                startup_timeout=2.0,
+            ) as session:
+                startup_started.set()
+                await asyncio.Event().wait()
+                yield session
+
+        service = BridgeService(
+            session_factory=lambda: slow_context(),
+            call_timeout=2.0,
+            setup_timeout=2.0,
+        )
+        runtime = AsyncBridgeRuntime(service)
+        request = (
+            {"operation": "call_tool", "name": "fixture_tool", "arguments": {"n": 1}}
+            if operation == "call_tool"
+            else {"operation": "list_tools"}
+        )
+        try:
+            runtime.start()
+            first_future = asyncio.run_coroutine_threadsafe(service.execute(request), runtime.loop)
+            await asyncio.wait_for(asyncio.to_thread(startup_started.wait, 2.0), timeout=3.0)
+            owner = service._session_owner
+
+            async def wait_for_child_pid() -> int:
+                while fixture.pid is None:
+                    await asyncio.sleep(0.005)
+                return fixture.pid
+
+            child_pid = await asyncio.wait_for(wait_for_child_pid(), timeout=1.0)
+            assert owner is not None and owner.task is not None
+            assert child_pid == fixture.pid and fixture.pid_alive()
+
+            second_future = asyncio.run_coroutine_threadsafe(service.execute(request), runtime.loop)
+            await asyncio.sleep(0.05)
+            assert not second_future.done()
+
+            close_started = time.monotonic()
+            close_task = asyncio.create_task(asyncio.to_thread(runtime.close), name="stalled-cold-runtime-close")
+
+            async def wait_for_closing() -> None:
+                while not service._closing:
+                    await asyncio.sleep(0.005)
+
+            await asyncio.wait_for(wait_for_closing(), timeout=2.0)
+            assert not second_future.done()
+            await asyncio.wait_for(close_task, timeout=DEFAULT_RUNTIME_CLOSE_TIMEOUT)
+            close_elapsed = time.monotonic() - close_started
+
+            assert close_elapsed < DEFAULT_RUNTIME_CLOSE_TIMEOUT
+            assert runtime.loop.is_closed()
+            assert not runtime._thread.is_alive()
+            assert first_future.done() and not first_future.cancelled()
+            assert second_future.done() and not second_future.cancelled()
+            first_result = await asyncio.wrap_future(first_future)
+            second_result = await asyncio.wrap_future(second_future)
+            assert first_result.status_code == 503
+            assert first_result.payload["error"]["code"] == "mcp_unavailable"
+            assert first_result.payload["error"]["app_reachable"] is False
+            assert second_result.status_code == 503
+            assert second_result.payload["error"]["code"] == "mcp_unavailable"
+            assert second_result.payload["error"]["app_reachable"] is False
+            methods = fixture.methods
+            assert "initialize" not in methods
+            assert "tools/list" not in methods
+            assert "tools/call" not in methods
+            assert fixture.connection_count == 1
+            await fixture.wait_for_closed(timeout=10.0)
+            assert not fixture.pid_alive()
+            assert owner.task.cancelling() == 1
+            assert_owner_terminal(owner, expected_cancelled=True)
+            assert service._session_owner is None
+        finally:
+            if not runtime._closed:
+                await asyncio.to_thread(runtime.close)
+            await close_fixture(fixture)
+
+    asyncio.run(scenario())
+
+
+def test_real_sdk_reconnect_retirement_during_shutdown_does_not_launch_second_child() -> None:
+    async def scenario() -> None:
+        first_fixture = FixtureMCPServer()
+        second_fixture = FixtureMCPServer()
+        first_path = await first_fixture.start()
+        second_path = await second_fixture.start()
+        retirement_started = asyncio.Event()
+        release_retirement = asyncio.Event()
+        factory_calls = 0
+
+        @asynccontextmanager
+        async def first_context() -> Any:
+            async with open_imcp_session(
+                server_path=first_path,
+                read_timeout_seconds=2.0,
+                startup_timeout=2.0,
+            ) as session:
+                try:
+                    yield session
+                finally:
+                    retirement_started.set()
+                    await release_retirement.wait()
+
+        def factory() -> Any:
+            nonlocal factory_calls
+            factory_calls += 1
+            if factory_calls == 1:
+                return first_context()
+            if factory_calls == 2:
+                return open_imcp_session(
+                    server_path=second_path,
+                    read_timeout_seconds=2.0,
+                    startup_timeout=2.0,
+                )
+            raise AssertionError("fixture server was launched more times than expected")
+
+        service = BridgeService(
+            session_factory=factory,
+            call_timeout=2.0,
+            setup_timeout=2.0,
+        )
+        reconnect_task: asyncio.Task[Any] | None = None
+        close_task: asyncio.Task[Any] | None = None
+        try:
+            first = await service.execute(
+                {"operation": "call_tool", "name": "fixture_tool", "arguments": {"n": 1}}
+            )
+            assert first.payload["ok"] is True
+            assert first_fixture.connection_count == 1
+
+            # Leave the first owner in place while making the next request take
+            # the reconnect retirement path.
+            service._session_known_dead = True
+            reconnect_task = asyncio.create_task(
+                service.execute(
+                    {"operation": "call_tool", "name": "fixture_tool", "arguments": {"n": 2}}
+                ),
+                name="reconnect-during-shutdown",
+            )
+            await asyncio.wait_for(retirement_started.wait(), timeout=2.0)
+            assert not reconnect_task.done()
+
+            close_task = asyncio.create_task(service.close(), name="reconnect-shutdown")
+            while not service._closing:
+                await asyncio.sleep(0)
+            assert not reconnect_task.done()
+            release_retirement.set()
+
+            second = await asyncio.wait_for(reconnect_task, timeout=10.0)
+            await asyncio.wait_for(close_task, timeout=10.0)
+            await first_fixture.wait_for_closed(timeout=10.0)
+
+            assert second.status_code == 503
+            assert second.payload["error"]["code"] == "mcp_unavailable"
+            assert first_fixture.connection_count == 1
+            assert second_fixture.connection_count == 0
+            assert factory_calls == 2
+            assert service._session_owner is None
+        finally:
+            release_retirement.set()
+            if not service._closed:
+                await service.close()
+            await close_fixture(first_fixture, second_fixture)
 
     asyncio.run(scenario())
 
