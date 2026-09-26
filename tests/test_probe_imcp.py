@@ -247,7 +247,9 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
             "is documented below; this is not a record of the operator's Mac configuration.",
             rendered,
         )
-        self.assertIn("No tool was invoked", rendered)
+        self.assertIn("Supported deployments require iMCP **>=1.5.1**", rendered)
+        self.assertIn("bundled `imcp-server` over stdio", rendered)
+        self.assertIn("no tool is invoked", rendered)
 
 
 if __name__ == "__main__":

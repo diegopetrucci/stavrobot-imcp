@@ -9,8 +9,8 @@ The bridge exposes an authenticated HTTP boundary for the iMCP services enabled
 by the operator:
 
 ```text
-iMCP app (macOS permissions and client approval)
-  -> local MCP transport (Bonjour discovery, forced loopback)
+iMCP app (>=1.5.1; macOS permissions and client approval)
+  -> bundled Contents/MacOS/imcp-server over stdio
   -> 127.0.0.1:8766/bridge (authenticated host bridge)
   -> host.docker.internal:8766/bridge (plugin-runner)
   -> Stavrobot imcp plugin
@@ -21,7 +21,9 @@ iMCP app (macOS permissions and client approval)
 1. Obtain explicit human approval for the services, tools, agents, and first
    read-only test operation. iMCP can expose personal calendar, contacts,
    messages, reminders, location, maps, and weather data; enable only the
-   services that have been selected.
+   services that have been selected. The bundled stdio entrypoint is supported
+   only by iMCP **1.5.1 or newer**; verify the selected app version and
+   `Contents/MacOS/imcp-server` before starting the bridge.
 2. Keep the bridge bound to `127.0.0.1` and use the fixed HTTP bridge port
    `8766`. Do **not** change the bind to `0.0.0.0` automatically if the
    container check fails. Stop and diagnose the host-gateway path instead.
@@ -35,15 +37,29 @@ iMCP app (macOS permissions and client approval)
    `~/.config/imcp-bridge-tools.json` so least privilege is deliberate.
 5. Keep the timeout ladder intact:
    `15s (bridge) < 20s (plugin client) < 30s (synchronous plugin-runner)`.
-   The helper and LaunchAgent wrapper explicitly pin the bridge's 10-second
-   `--call-timeout` default, which yields its 15-second outer deadline. Any
-   override must keep the resulting bridge outer deadline strictly below the
-   plugin's 20 seconds.
+   The bundled stdio startup has a separate 5-second bound, and the helper and
+   LaunchAgent wrapper explicitly pin the bridge's 10-second `--call-timeout`
+   default, which yields its 15-second outer deadline. The SDK's stdio shutdown
+   escalation is bounded at 6.5 seconds, with a 7-second configuration floor.
+   The 18-second runtime-close invariant therefore imposes a strict `<11s`
+   ceiling on `--call-timeout` (`call timeout + shutdown timeout < 18s`); a
+   larger shutdown setting lowers that ceiling. Any override must keep the
+   resulting bridge outer deadline strictly below the plugin's 20 seconds and
+   leave enough time for stdio teardown.
 6. Use exactly one supervisor at a time: either the tmux start helper or the
    direct LaunchAgent template below. Running both causes a collision on
    `127.0.0.1:8766`.
 
 ## Prerequisites and virtual environment
+
+The stdio migration requires an installed iMCP app at version **1.5.1 or
+newer** with its bundled server executable. Check both before preparing the
+bridge; do not continue with an older app or a missing executable:
+
+```sh
+mdls -name kMDItemVersion -raw /Applications/iMCP.app
+test -x /Applications/iMCP.app/Contents/MacOS/imcp-server
+```
 
 In a trusted local terminal, prepare the checkout and its explicit Python
 virtual environment. These commands are instructions for a later operator;
@@ -64,18 +80,22 @@ adapt the paths deliberately rather than adding a second, untracked runtime.
 
 All prompts and approvals in this section are manual:
 
-1. Open the installed iMCP app in the logged-in macOS user session.
+1. Open the installed iMCP app in the logged-in macOS user session and verify
+   that it is **1.5.1 or newer** with the executable checked in the prerequisite
+   section above.
 2. Enable only the agreed iMCP services. Do not infer availability from an
    upstream source checkout or from an old tool list.
 3. In **System Settings > Privacy & Security**, grant only the macOS access
    required by those services. Complete any iMCP-native permission flow. For
    Messages history, use the app's documented file-selection flow if it asks
    for access; this integration does not describe or test message sending.
-4. Start the bridge once the app is ready. On the first MCP connection, iMCP
-   may display a **Connection Request** window for the client named
-   `stavrobot-imcp-bridge`. Review the client and approve it manually. Do not
-   treat a missing prompt as proof that permissions or client trust are correct;
-   check the app's remembered-client and service settings.
+4. Start the bridge after the app is ready. The first authenticated
+   `list_tools` request launches the bundled `imcp-server` over stdio. iMCP may
+   display a **Connection Request** window for the client named
+   `stavrobot-imcp-bridge`; review the client and approve it manually. A
+   remembered approval may suppress later prompts, but a missing prompt is not
+   proof that permissions or client trust are correct. Check the app's
+   remembered-client and service settings.
 5. Use a disposable, read-only operation for the first end-to-end test. Do not
    use a write, delete, message, reminder, or calendar mutation as a health
    check.
@@ -177,9 +197,11 @@ start converges on one session; it does not kill other tmux sessions or print
 session, it fails clearly and leaves the existing listener alone. Do not work
 around that error by changing the bridge port or exposing another interface.
 The helper passes `--allowlist-file ~/.config/imcp-bridge-tools.json` and
-`--call-timeout 10`; do not remove either safety boundary. The dynamic port
-used internally by iMCP is not a plugin or HTTP port and must not be added to
-configuration or logs.
+`--call-timeout 10`; do not remove either safety boundary. The bridge launches
+`/Applications/iMCP.app/Contents/MacOS/imcp-server` as a local child over stdio
+on demand. There is no iMCP TCP port to configure, discover, expose, or add to
+logs; only the fixed authenticated HTTP bridge endpoint is part of the plugin
+contract.
 
 ### 3.1 Trigger the first host-side MCP connection and approve it manually
 
@@ -207,6 +229,14 @@ reaches the 20-second client timeout), wait for the command to exit and rerun
 read-only discovery request is safe; do not generalize that retry rule to a
 `call_tool` whose outcome could be unknown. The helper never invokes an iMCP
 tool and never retries automatically.
+
+The bridge keeps a successful MCP session open for later requests. If iMCP or
+`imcp-server` exits, the next request reconnects lazily by launching a fresh
+stdio child; it does not replay a call. If a `call_tool` may have been
+dispatched before its response was lost, treat `error.code: "unknown_outcome"`
+as non-retryable and inspect the app before any further action. A later
+read-only `list_tools` request can establish the fresh session after approval
+or startup recovery.
 
 The unauthenticated GET in §6.1 is only a route/authentication check. It cannot
 trigger iMCP client approval because the bridge rejects it before opening an
@@ -485,7 +515,10 @@ launchctl bootout "gui/$(id -u)/com.stavrobot.imcp"
 launchctl bootout "gui/$(id -u)/com.stavrobot.imcp-app"
 ```
 
-Use one bridge supervisor, never tmux and launchd together.
+Allow up to 18 seconds for the bridge's graceful `launchctl bootout` drain
+before treating it as stuck. Do not force-kill the bridge or remove either
+plist prematurely during that window. Use one bridge supervisor, never tmux
+and launchd together.
 
 Logs are in `~/Library/Logs/Stavrobot/imcp-bridge.{out,err}.log`. The launch job
 uses umask 077. Treat logs as operational data and avoid publishing them.
@@ -509,6 +542,10 @@ causes launchd to restart it). Remove/disable both login jobs to undo startup:
 launchctl bootout "gui/$(id -u)/com.stavrobot.imcp"
 launchctl bootout "gui/$(id -u)/com.stavrobot.imcp-app"
 ```
+
+Allow up to 18 seconds for the bridge's graceful `launchctl bootout` drain
+before treating it as stuck. Do not force-kill the bridge or remove either
+plist prematurely during that window.
 
 Remove the corresponding managed LaunchAgent files only when uninstalling.
 Keep private credentials unless intentionally removing or rotating them.
@@ -558,37 +595,43 @@ and that every `telegram-group-*` agent's actual `allowed_plugins` value
 excludes iMCP. Keep the source bundle and this runbook if a later re-deployment
 is approved.
 
-## Temporary dynamic-port / forced-loopback workaround
+## Stdio transport migration and rollback
 
-The iMCP app's local MCP service advertises a Bonjour `_mcp._tcp.local.` service
-with a dynamic internal port. The current transport uses Bonjour only to
-identify the local service and extract that port; it discards all advertised
-interface addresses and connects exclusively to `127.0.0.1:<discovered-port>`.
-The Stavrobot-facing HTTP boundary is separately fixed at
-`127.0.0.1:8766/bridge`. The discovered iMCP port is an internal implementation
-detail: it is not a plugin URL, must not be hard-coded, and must not be printed
-in operational output.
+This revision uses the supported bundled `imcp-server` stdio entrypoint from
+iMCP **1.5.1 or newer**. The HTTP boundary remains
+`127.0.0.1:8766/bridge`; the plugin URL, Bearer authentication, JSON operation
+names, response envelope, allowlist, and no-LAN-exposure rule do not change.
+There is no internal iMCP TCP endpoint to configure or expose.
 
-This forced-loopback/dynamic-port arrangement is a temporary compatibility
-workaround while a stable, documented host/container transport is tracked:
+If the selected app is older than 1.5.1, the bundled executable is missing or
+not executable, or the stdio migration fails its read-only verification, stop
+before invoking a tool. Do not copy individual transport files or reintroduce a
+manually selected port into this revision.
 
-- [stavrobot-imcp issue #1](https://github.com/diegopetrucci/stavrobot-imcp/issues/1)
-- [upstream mattt/iMCP issue #142](https://github.com/mattt/iMCP/issues/142)
+### Roll back to the prior custom transport
 
-Do not remove the workaround merely because one live call succeeds. Remove or
-replace it only after all of the following are true:
+To roll back the migration, perform a complete deployment rollback to the last
+known-good repository revision (or release artifact) that contains the prior
+custom TCP transport. That revision must be used with its own matching
+requirements; do not mix the old transport with this revision's source or
+virtual environment.
 
-- a released iMCP version, including the version actually installed by the
-  operator, documents a stable supported transport or configurable endpoint;
-- the relevant upstream/project issue status and security implications have
-  been reviewed;
-- reconnect after an iMCP restart and a changed internal port is tested;
-- authenticated reachability is reverified from `plugin-runner` through
-  `host.docker.internal`, with the bridge still restricted to an intentional
-  interface; and
-- transport code, start/plist configuration, tests, and this runbook are
-  updated together, retaining token protection and the no-LAN-exposure rule.
+1. Disable the iMCP plugin in Stavrobot and stop the active tmux or LaunchAgent
+   supervisor using the procedure in **Rollback and uninstall** above. Preserve
+   the token, allowlist, and approved audit record unless they are separately
+   being revoked.
+2. Deploy the reviewed prior revision as a complete unit and install its pinned
+   dependencies in a clean virtual environment. Keep the bridge bind, port,
+   path, and auth settings at `127.0.0.1:8766/bridge`.
+3. Start that bridge and resolve any manual iMCP permission or client-approval
+   prompt. Run the host-side read-only `list_tools` check before re-enabling
+   the plugin; a listing retry is safe, but do not replay a `call_tool` with an
+   uncertain outcome.
+4. Re-enable the plugin only after the authenticated listing succeeds from
+   `plugin-runner`. Its `bridge_url` and HTTP request/response contract remain
+   unchanged across this transport rollback.
 
-Until those criteria are met, keep Bonjour discovery and forced loopback. Never
-respond to a failed container check by binding the bridge to `0.0.0.0` or by
-exposing the discovered internal port.
+When returning to stdio, stop the prior supervisor, deploy this revision with
+an iMCP app at least 1.5.1, reinstall this revision's dependencies, and repeat
+the executable, approval, reconnect, and plugin-runner checks. Never resolve a
+failed container check by binding the bridge to `0.0.0.0`.

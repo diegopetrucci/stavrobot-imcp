@@ -1,8 +1,10 @@
 # iMCP tools
 
-Captured from iMCP **1.4.1** on **2026-09-07** using a read-only MCP handshake and `tools/list`.
+Captured from iMCP **1.4.1** on **2026-09-07** using a read-only MCP handshake and `tools/list` (legacy snapshot).
 
 The generic full iMCP 1.4.1 tool surface when all services are enabled is documented below; this is not a record of the operator's Mac configuration.
+
+This legacy inventory is not a deployment compatibility claim. Supported deployments require iMCP **>=1.5.1** and use the bundled `imcp-server` over stdio. Run `scripts/probe_imcp.py` against the installed supported app to refresh this read-only snapshot before changing an allowlist.
 
 Only tool names, descriptions, and input schemas are recorded below. No tool was invoked and no tool result or personal data was captured.
 
