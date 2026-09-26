@@ -28,7 +28,11 @@ iMCP app (macOS permissions and manual client approval)
   [`plugin/imcp/MAINTAINING.md`](plugin/imcp/MAINTAINING.md).
 - The bridge token, host allowlist, and installed plugin configuration are
   separate operator-managed configuration. Keep credentials out of this
-  repository, agent chat, command output, and logs.
+  repository, agent chat, command output, and logs. If the live host allowlist
+  contains `*`, a future iMCP release can add newly exposed tools without any
+  allowlist edit; review release notes and a fresh read-only `tools/list` result
+  before relying on that expanded surface. This documentation does not change
+  the live allowlist.
 
 ## Python 3.14 setup and local verification
 
@@ -134,7 +138,16 @@ When iMCP shows its Connection Request window, approve the client manually.
 The probe performs the MCP handshake and requests only `tools/list`; it never
 invokes an MCP tool. It uses the shared Bonjour-discovered loopback transport
 and writes only tool names, descriptions, and input schemas to
-`docs/imcp-tools.md`.
+`docs/imcp-tools.md`. By default, the recorded app version is read from the
+selected app's `Contents/Info.plist` `CFBundleShortVersionString`. Use
+`--app-version VERSION` to explicitly override it. Without an override,
+missing or invalid version metadata causes the probe to fail rather than
+record a guessed version. Before connecting, the probe compares the running
+iMCP process's canonical executable path and device/inode identity with the
+selected app, and checks the same PID and identity again after `tools/list`.
+After a Sparkle update or rollback, manually quit and relaunch iMCP before
+capture; the probe refuses a different or stale process and never terminates
+or relaunches one automatically.
 
 ## Remove the local environment
 

@@ -1,8 +1,13 @@
 # iMCP tools
 
-Captured from iMCP **1.4.1** on **2026-09-07** using a read-only MCP handshake and `tools/list`.
+Captured from iMCP **1.6.0** on **2026-09-26** using a read-only MCP handshake and `tools/list`.
 
-The generic full iMCP 1.4.1 tool surface when all services are enabled is documented below; this is not a record of the operator's Mac configuration.
+The generic full iMCP 1.6.0 tool surface when all services are enabled is documented below; this is not a record of the operator's Mac configuration.
+
+If the live bridge allowlist uses `*`, this surface can grow when iMCP adds a
+tool without any allowlist edit. Treat every upgrade as requiring a fresh
+`tools/list` review and explicit approval of the expanded read/write surface;
+this document does not alter the live allowlist.
 
 Only tool names, descriptions, and input schemas are recorded below. No tool was invoked and no tool result or personal data was captured.
 
@@ -294,6 +299,36 @@ Only tool names, descriptions, and input schemas are recorded below. No tool was
     }
   },
   {
+    "name": "events_delete",
+    "description": "Delete a calendar event by identifier. For a recurring event, pass the start date of the occurrence to delete.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "identifier": {
+          "description": "The event identifier",
+          "type": "string"
+        },
+        "span": {
+          "default": "thisEvent",
+          "description": "For recurring events: delete only this occurrence, or this and all future events",
+          "enum": [
+            "thisEvent",
+            "futureEvents"
+          ],
+          "type": "string"
+        },
+        "start": {
+          "description": "Start date of the occurrence to delete (ISO 8601). Required for recurring events, since every occurrence shares the same identifier.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "identifier"
+      ],
+      "type": "object"
+    }
+  },
+  {
     "name": "capture_take_picture",
     "description": "Take a picture with the device camera",
     "inputSchema": {
@@ -509,8 +544,29 @@ Only tool names, descriptions, and input schemas are recorded below. No tool was
     }
   },
   {
+    "name": "contacts_list",
+    "description": "List contacts in a stable order. Returns every contact by default; use limit and offset to page through large address books.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "properties": {
+        "limit": {
+          "description": "Maximum number of contacts to return",
+          "minimum": 1,
+          "type": "integer"
+        },
+        "offset": {
+          "default": 0,
+          "description": "Number of contacts to skip, in the same stable order",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "type": "object"
+    }
+  },
+  {
     "name": "contacts_update",
-    "description": "Update an existing contact's information. Only provide values for properties that need to be changed; omit any properties that should remain unchanged.",
+    "description": "Update an existing contact's information. Only provide values for properties that need to be changed; omit any properties that should remain unchanged. Reading or changing contact notes is not supported.",
     "inputSchema": {
       "properties": {
         "birthday": {
@@ -760,12 +816,12 @@ Only tool names, descriptions, and input schemas are recorded below. No tool was
   },
   {
     "name": "location_geocode",
-    "description": "Convert an address to geographic coordinates",
+    "description": "Convert a postal address to geographic coordinates.\nPlace names can resolve to unrelated street addresses.\nUse maps_search for place names, businesses, and landmarks.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
         "address": {
-          "description": "Address to geocode",
+          "description": "Postal address to geocode",
           "type": "string"
         }
       },
@@ -835,7 +891,7 @@ Only tool names, descriptions, and input schemas are recorded below. No tool was
   },
   {
     "name": "maps_directions",
-    "description": "Get directions between two locations with optional transport type",
+    "description": "Get automobile or walking directions between two locations.\nUse maps_eta for a transit travel-time estimate.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
@@ -883,11 +939,10 @@ Only tool names, descriptions, and input schemas are recorded below. No tool was
         },
         "transportType": {
           "default": "automobile",
-          "description": "Transport type",
+          "description": "Transport type for the route",
           "enum": [
             "automobile",
             "walking",
-            "transit",
             "any"
           ],
           "type": "string"
@@ -1147,14 +1202,23 @@ Only tool names, descriptions, and input schemas are recorded below. No tool was
   },
   {
     "name": "messages_fetch",
-    "description": "Fetch messages from the Messages app",
+    "description": "Fetch messages from the Messages app. Each message names the conversation it belongs to (isPartOf), with its participants.",
     "inputSchema": {
       "additionalProperties": false,
       "properties": {
+        "attachments": {
+          "default": false,
+          "description": "List each message's attachments (attachment: name, encodingFormat, contentSize, @id) and include messages that carry attachments but no text",
+          "type": "boolean"
+        },
         "end": {
           "description": "End of the date range (exclusive). If timezone is omitted, local time is assumed. Date-only uses local midnight.",
           "format": "date-time",
           "type": "string"
+        },
+        "isRead": {
+          "description": "If true, fetch read messages; if false, unread incoming; if omitted, fetch all",
+          "type": "boolean"
         },
         "limit": {
           "default": 30,
