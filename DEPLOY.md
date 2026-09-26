@@ -32,7 +32,12 @@ iMCP app (macOS permissions and client approval)
 4. Use a trusted host allowlist with explicit iMCP tool names. Although
    `bridge/server.py` defaults to `*` when no allowlist is supplied, deployment
    through the helper or LaunchAgent wrapper below requires
-   `~/.config/imcp-bridge-tools.json` so least privilege is deliberate.
+   `~/.config/imcp-bridge-tools.json` so least privilege is deliberate. A live
+   `*` entry is not a fixed snapshot: when a later iMCP release adds a tool,
+   the existing wildcard admits it without an allowlist edit. The live
+   wildcard configuration is intentionally unchanged here; before relying on
+   it after an upgrade, review the release notes and a fresh read-only
+   `tools/list` result, and obtain explicit approval for the expanded surface.
 5. Keep the timeout ladder intact:
    `15s (bridge) < 20s (plugin client) < 30s (synchronous plugin-runner)`.
    The helper and LaunchAgent wrapper explicitly pin the bridge's 10-second
@@ -59,6 +64,149 @@ The start helper and plist intentionally invoke
 `$HOME/Developer/stavrobot-imcp/.venv/bin/python`, not whichever `python3` an
 interactive shell happens to select. If the checkout is elsewhere, render or
 adapt the paths deliberately rather than adding a second, untracked runtime.
+
+## Installed iMCP app upgrade and rollback
+
+The local app was upgraded from 1.5.3 to upstream 1.6.0 using the
+[1.6.0 release](https://github.com/mattt/iMCP/releases/tag/1.6.0) and its
+[`iMCP.zip`](https://github.com/mattt/iMCP/releases/download/1.6.0/iMCP.zip)
+asset. The asset SHA-256 is
+`74fe4271f9a2264b30a028f063f0c346ff9c0a26f59a2a4b60147ed33936f1b6`. Before
+replacement, the new bundle was verified as notarized Developer ID Application
+`dododo, LLC` with TeamIdentifier `TTY35UM57S`, matching the previous trusted
+bundle. Sparkle automatic updates can replace the app bundle again on a later
+check or launch, including after an app-only rollback. The complete 1.5.3
+rollback bundle is retained outside the app at:
+
+```text
+$HOME/Backups/iMCP/iMCP-1.5.3-20260926T093442Z.app
+```
+
+To roll back only the app, leaving the sandbox container, macOS permissions,
+operator service selections, bridge allowlist, and LaunchAgents untouched, save
+this block as a temporary script, review it, and run it as one script (for
+example, `sh /path/to/imcp-rollback.sh`) from the logged-in macOS account; do
+not paste individual lines into an interactive shell. The temporary failed-new
+bundle is kept until the restored backup passes its signature checks:
+
+```sh
+set -eu
+backup="$HOME/Backups/iMCP/iMCP-1.5.3-20260926T093442Z.app"
+current=/Applications/iMCP.app
+rollback_tmp="$(mktemp -d /private/tmp/imcp-rollback.XXXXXX)"
+staging="$rollback_tmp/iMCP.app.1.6.0"
+
+if ! /usr/libexec/PlistBuddy -c 'Print:CFBundleShortVersionString' \
+    "$backup/Contents/Info.plist" | grep -Fx 1.5.3; then
+  echo "backup version check failed; refusing rollback" >&2
+  exit 1
+fi
+if ! codesign --verify --deep --strict "$backup"; then
+  echo "backup code-signing check failed; refusing rollback" >&2
+  exit 1
+fi
+if ! spctl --assess --type execute "$backup"; then
+  echo "backup notarization check failed; refusing rollback" >&2
+  exit 1
+fi
+osascript -e 'tell application id "co.dododo.iMCP" to quit' || true
+for _ in $(seq 1 30); do
+  if ! /usr/bin/pgrep -x iMCP >/dev/null 2>&1; then break; fi
+  sleep 1
+done
+if /usr/bin/pgrep -x iMCP >/dev/null 2>&1; then
+  echo "iMCP did not quit; refusing rollback" >&2
+  exit 1
+fi
+
+restore_original_app() {
+  rm -rf "$current"
+  mv "$staging" "$current"
+}
+
+mv "$current" "$staging"
+if ! ditto --rsrc --extattr --acl "$backup" "$current"; then
+  restore_original_app
+  exit 1
+fi
+if ! /usr/libexec/PlistBuddy -c 'Print:CFBundleShortVersionString' \
+    "$current/Contents/Info.plist" | grep -Fx 1.5.3; then
+  echo "restored app version check failed; restoring original app" >&2
+  restore_original_app
+  exit 1
+fi
+if ! codesign --verify --deep --strict "$current"; then
+  echo "restored app code-signing check failed; restoring original app" >&2
+  restore_original_app
+  exit 1
+fi
+if ! spctl --assess --type execute "$current"; then
+  echo "restored app notarization check failed; restoring original app" >&2
+  restore_original_app
+  exit 1
+fi
+rm -rf "$rollback_tmp"
+/usr/bin/open -g "$current"
+for _ in $(seq 1 30); do
+  if /usr/bin/pgrep -x iMCP >/dev/null 2>&1; then break; fi
+  sleep 1
+done
+if ! /usr/bin/pgrep -x iMCP >/dev/null 2>&1; then
+  echo "iMCP did not relaunch after rollback; verify it manually" >&2
+  exit 1
+fi
+if ! /usr/libexec/PlistBuddy -c 'Print:CFBundleShortVersionString' \
+    "$current/Contents/Info.plist" | grep -Fx 1.5.3; then
+  echo "post-relaunch version is not 1.5.3; Sparkle may have updated the app" >&2
+  exit 1
+fi
+```
+
+If Sparkle automatic updates are enabled, treat that post-relaunch check as a
+point-in-time verification rather than a permanent pin. The iMCP/Sparkle
+**Settings > Updates** controls are named **Automatically check for updates**
+(`SUEnableAutomaticChecks`) and **Automatically download updates**
+(`SUAutomaticallyUpdate`). To record the current values without exposing
+unrelated preferences, read only these named keys:
+
+```sh
+/usr/bin/defaults read co.dododo.iMCP SUEnableAutomaticChecks
+/usr/bin/defaults read co.dododo.iMCP SUAutomaticallyUpdate
+/usr/bin/defaults read co.dododo.iMCP SUSendProfileInfo
+```
+
+The installed 1.6.0 app was inspected without changing it on 2026-09-26;
+the two update controls were enabled (`1`), and **Send system profile
+information** (`SUSendProfileInfo`) was disabled (`0`). These values are an
+observation of the live defaults, not a setting change made by this task.
+
+Before a durable rollback, obtain explicit approval to turn off both
+**Automatically check for updates** and **Automatically download updates** in
+the iMCP/Sparkle Updates controls. Quit iMCP and verify that it has exited
+before making either approved preference change; do not write Sparkle
+preferences while iMCP is running. For this build, the visible iMCP menu
+contains **Check for Updates...**, while the durable controls are Sparkle's
+named settings above; if the Settings > Updates pane is not exposed, apply the
+same approved change explicitly from a trusted terminal after that quit check:
+
+```sh
+/usr/bin/defaults write co.dododo.iMCP SUEnableAutomaticChecks -bool false
+/usr/bin/defaults write co.dododo.iMCP SUAutomaticallyUpdate -bool false
+```
+
+Leave iMCP quit after changing those controls and run the app-only rollback
+script above; it repeats the quit check before replacing the app and relaunches
+the restored 1.5.3 bundle. Verify 1.5.3 again after relaunch. Leave both
+controls disabled for a durable rollback, or restore their recorded prior
+values only after an operator explicitly approves automatic updates again.
+This task does not change either setting. After every upgrade or rollback,
+manually quit and relaunch iMCP before a metadata capture; the probe then
+verifies that the running process is the selected app executable and that its
+PID and filesystem identity remain unchanged through `tools/list`. It fails
+closed instead of terminating or relaunching a mismatched process.
+
+Do not delete the app container, reset TCC permissions, enable services, edit
+the allowlist, or reload LaunchAgents as part of this app-only rollback.
 
 ## 1. Manually prepare iMCP and macOS permissions
 
