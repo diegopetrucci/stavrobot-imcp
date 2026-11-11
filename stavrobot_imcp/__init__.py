@@ -6,6 +6,7 @@ from .transport import (
     DEFAULT_STARTUP_TIMEOUT,
     MIN_SHUTDOWN_TIMEOUT,
     TransportConfigurationError,
+    load_client_credential,
     open_imcp_session,
 )
 
@@ -15,5 +16,6 @@ __all__ = [
     "DEFAULT_STARTUP_TIMEOUT",
     "MIN_SHUTDOWN_TIMEOUT",
     "TransportConfigurationError",
+    "load_client_credential",
     "open_imcp_session",
 ]

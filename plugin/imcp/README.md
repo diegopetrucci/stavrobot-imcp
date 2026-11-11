@@ -1,10 +1,22 @@
 # iMCP bridge plugin for Stavrobot
 
-Connects Stavrobot to [iMCP](https://github.com/mattt/iMCP), exposing macOS-native services — Calendar, Contacts, Messages, Reminders, Location, Maps, Weather, Shortcuts, and Camera/audio/screenshot capture — to the assistant through a host-side authenticated bridge.
+Connects Stavrobot to [iMCP](https://github.com/mattt/iMCP), exposing macOS-native services to the assistant through a host-side authenticated bridge.
+
+## Services
+
+When enabled in iMCP (1.8.2+) and allowlisted on the bridge:
+
+- Calendar (including `events_update`), Contacts, Reminders (update/delete, list create/rename/delete, recurrence)
+- Messages (attachments, `chatId`, `messages_attachment_read`), Phone calls, Voicemail
+- Mail (read-only search/read plus `mail_compose` draft), Notes, Voice Memos
+- Music, Home (HomeKit; requires the self-signed iMCP Helper)
+- Location, Maps, Weather, Shortcuts, Capture (camera, audio, screenshot), Utilities
+
+Mail, Notes, Voice Memos, Voicemail, and Messages attachments need folder access granted in iMCP. The bridge caps responses at 256 KiB with a 10 s call timeout, so large binary results (audio, attachments, captures) may be truncated or fail; text and transcripts work.
 
 ## Prerequisites
 
-- A Mac running iMCP **1.5.1 or newer**, with the bundled
+- A Mac running iMCP **1.8.2 or newer**, with the bundled
   `Contents/MacOS/imcp-server` executable and the services you want enabled.
 - The host iMCP bridge running and reachable from the Stavrobot plugin-runner (the operator prepares this on the host before installing the plugin).
 - A bridge token and tool allowlist created on that host.

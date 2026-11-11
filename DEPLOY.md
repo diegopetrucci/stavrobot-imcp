@@ -9,7 +9,7 @@ The bridge exposes an authenticated HTTP boundary for the iMCP services enabled
 by the operator:
 
 ```text
-iMCP app (>=1.5.1; macOS permissions and client approval)
+iMCP app (>=1.8.2; macOS permissions and client approval)
   -> bundled Contents/MacOS/imcp-server over stdio
   -> 127.0.0.1:8766/bridge (authenticated host bridge)
   -> host.docker.internal:8766/bridge (plugin-runner)
@@ -22,7 +22,7 @@ iMCP app (>=1.5.1; macOS permissions and client approval)
    read-only test operation. iMCP can expose personal calendar, contacts,
    messages, reminders, location, maps, and weather data; enable only the
    services that have been selected. The bundled stdio entrypoint is supported
-   only by iMCP **1.5.1 or newer**; verify the selected app version and
+   only by iMCP **1.8.2 or newer**; verify the selected app version and
    `Contents/MacOS/imcp-server` before starting the bridge.
 2. Keep the bridge bound to `127.0.0.1` and use the fixed HTTP bridge port
    `8766`. Do **not** change the bind to `0.0.0.0` automatically if the
@@ -52,7 +52,7 @@ iMCP app (>=1.5.1; macOS permissions and client approval)
 
 ## Prerequisites and virtual environment
 
-The stdio migration requires an installed iMCP app at version **1.5.1 or
+The stdio migration requires an installed iMCP app at version **1.8.2 or
 newer** with its bundled server executable. Check both before preparing the
 bridge; do not continue with an older app or a missing executable:
 
@@ -81,7 +81,7 @@ adapt the paths deliberately rather than adding a second, untracked runtime.
 All prompts and approvals in this section are manual:
 
 1. Open the installed iMCP app in the logged-in macOS user session and verify
-   that it is **1.5.1 or newer** with the executable checked in the prerequisite
+   that it is **1.8.2 or newer** with the executable checked in the prerequisite
    section above.
 2. Enable only the agreed iMCP services. Do not infer availability from an
    upstream source checkout or from an old tool list.
@@ -169,6 +169,53 @@ configuration preflight runs before it execs `bridge/server.py` and enforces
 these file modes.
 The allowlist contains no credential, but keep it owner-only so it cannot be
 silently broadened by another account.
+
+### 2.1 Tiered allowlist guidance (iMCP 1.8.x)
+
+Group tools into tiers and opt in explicitly, one tool name at a time. Verify
+names against the installed app's `tools/list` (`scripts/probe_imcp.py`); this
+list reflects iMCP 1.8.3.
+
+- **Read-only tier** (reasonable starting point once the service is approved):
+  `calendars_list`, `events_fetch`, `contacts_list`, `contacts_me`,
+  `contacts_search`, `messages_fetch`, `reminders_fetch`, `reminders_lists`,
+  `phone_calls_fetch`, `voicemails_fetch`, `voicemail_transcript_fetch`,
+  `mail_mailboxes_list`, `mail_messages_search`, `mail_messages_read`,
+  `notes_folders`, `notes_fetch`, `notes_read`, `voice_memos_fetch`,
+  `voice_memo_transcript_fetch`, `music_now_playing`, `music_catalog_search`,
+  `location_current`, `location_geocode`, `location_reverse-geocode`, `maps_search`, `maps_directions`,
+  `maps_eta`, `maps_explore`, `maps_generate`, `weather_current`,
+  `weather_hourly`, `weather_daily`, `weather_minute`, `shortcuts_list`, and
+  the Home read tools (`homes_list`, `home_export`, `rooms_list`, `zones_list`,
+  `accessories_list`, `accessories_get`, `characteristics_read`,
+  `scenes_list`, `automations_list`). `messages_attachment_read`,
+  `voicemail_audio_fetch` and `voice_memo_audio_fetch` return large binary data
+  (see limits below) and are sensitive even though they are reads.
+- **Write / side-effect tier** (enable only with explicit approval per tool):
+  `events_create`, `events_update`, `events_delete`, `contacts_create`,
+  `contacts_update`, `reminders_create`, `reminders_update`,
+  `reminders_delete`, `reminders_lists_create`, `reminders_lists_rename`,
+  `reminders_lists_delete`, `mail_compose` (opens a draft), `music_control`,
+  `phone_call`, `shortcuts_run`, `utilities_beep`, the capture tools
+  (`capture_take_picture`, `capture_record_audio`, `capture_take_screenshot`),
+  and every Home write tool (`characteristics_write`, `scenes_execute`,
+  `scenes_create`/`_update`/`_remove`, `automations_create`/`_update`/`_remove`,
+  `accessories_identify`/`_rename`/`_assign_room`/`_remove`, `services_rename`,
+  `rooms_create`/`_rename`/`_remove`, `zones_create`/`_update`/`_remove`). Delete/remove
+  tools are destructive. `shortcuts_run` can do anything the shortcut does.
+
+Never use `*`. Do not use a write-tier tool as a health check.
+
+### 2.2 Limits and folder access
+
+- The bridge caps each response at 256 KiB and each call at 10 seconds. Large
+  binary results (voicemail and voice-memo audio, message attachments, camera
+  or screenshot captures) may be truncated (`truncated: true`) or fail; text
+  results and transcripts work.
+- Mail, Notes, Voice Memos, Voicemail, and Messages attachments need folder
+  access granted inside iMCP (its service settings) in addition to macOS
+  privacy permissions. Home requires the self-signed iMCP Helper to be paired
+  per the upstream iMCP README.
 
 ## 3. Start the host bridge
 
@@ -595,15 +642,49 @@ and that every `telegram-group-*` agent's actual `allowed_plugins` value
 excludes iMCP. Keep the source bundle and this runbook if a later re-deployment
 is approved.
 
+## Upgrading to iMCP 1.8.2+ (client credential)
+
+iMCP 1.8.2 fixes security advisories GHSA-pfc6-qp66-c2ff and
+GHSA-q4pc-f59f-9xmw and is the minimum supported version. Operator steps:
+
+1. Stop the bridge supervisor (tmux session or LaunchAgent, see **Rollback and
+   uninstall**), then update iMCP.app to 1.8.2 or newer and open it.
+2. Start the bridge and run `./scripts/check_bridge.sh`. When iMCP shows the
+   **Connection Request** for `stavrobot-imcp-bridge`, approve it and choose
+   **Always trust this client**. iMCP then shows a client credential once.
+3. Store it privately without echoing it. Remove any old file first (umask
+   does not tighten an existing one), then paste at the silent prompt and press
+   Return:
+
+   ```sh
+   rm -f "$HOME/.config/imcp-client.credential"
+   ( umask 077; IFS= read -rs cred && printf '%s\n' "$cred" > "$HOME/.config/imcp-client.credential" )
+   chmod 600 "$HOME/.config/imcp-client.credential"
+   ```
+
+   Never put it in chat, logs, shell history, the plist, or Git. Mode 0400 or
+   0600 is accepted.
+4. Restart the bridge. The start helper and `scripts/run_launchd_bridge.py`
+   pass `--client-credential-file` only when that file exists (an existing file
+   must be private); `scripts/probe_imcp.py` accepts the same option. The bridge
+   pings a reused session before each request and relaunches `imcp-server` if it
+   exited, without replaying a call.
+5. Re-run `./scripts/check_bridge.sh`, then review the allowlist per §2.1.
+
+Undo: stop the bridge, delete `~/.config/imcp-client.credential`, remove the
+trusted client in iMCP's settings (revokes the credential), and restart; the
+next connection will prompt for approval again. Reverting to an app older than
+1.8.2 is unsupported.
+
 ## Stdio transport migration and rollback
 
 This revision uses the supported bundled `imcp-server` stdio entrypoint from
-iMCP **1.5.1 or newer**. The HTTP boundary remains
+iMCP **1.8.2 or newer**. The HTTP boundary remains
 `127.0.0.1:8766/bridge`; the plugin URL, Bearer authentication, JSON operation
 names, response envelope, allowlist, and no-LAN-exposure rule do not change.
 There is no internal iMCP TCP endpoint to configure or expose.
 
-If the selected app is older than 1.5.1, the bundled executable is missing or
+If the selected app is older than 1.8.2, the bundled executable is missing or
 not executable, or the stdio migration fails its read-only verification, stop
 before invoking a tool. Do not copy individual transport files or reintroduce a
 manually selected port into this revision.
@@ -632,6 +713,6 @@ virtual environment.
    unchanged across this transport rollback.
 
 When returning to stdio, stop the prior supervisor, deploy this revision with
-an iMCP app at least 1.5.1, reinstall this revision's dependencies, and repeat
+an iMCP app at least 1.8.2, reinstall this revision's dependencies, and repeat
 the executable, approval, reconnect, and plugin-runner checks. Never resolve a
 failed container check by binding the bridge to `0.0.0.0`.

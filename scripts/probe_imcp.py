@@ -26,13 +26,13 @@ if str(REPO_ROOT) not in sys.path:
 
 from mcp import types
 
-from stavrobot_imcp import open_imcp_session
+from stavrobot_imcp import load_client_credential, open_imcp_session
 
 
 APP_PATH = Path("/Applications/iMCP.app")
-# The bundled imcp-server is supported from iMCP 1.5.1 onward. Operators can
+# The bundled imcp-server is supported from iMCP 1.8.2 onward. Operators can
 # pass the installed version explicitly when recording a metadata snapshot.
-APP_VERSION = "1.5.1"
+APP_VERSION = "1.8.2"
 CLIENT_NAME = "imcp-tools-probe"
 CLIENT_VERSION = "1.0.0"
 DEFAULT_TIMEOUT = 300.0
@@ -85,9 +85,18 @@ def _metadata_for_tool(tool: types.Tool) -> dict[str, Any]:
     }
 
 
-async def _list_all_tools(app_path: Path = APP_PATH) -> list[dict[str, Any]]:
+async def _list_all_tools(
+    app_path: Path = APP_PATH,
+    client_credential_file: Path | None = None,
+) -> list[dict[str, Any]]:
+    client_credential = (
+        load_client_credential(client_credential_file)
+        if client_credential_file is not None
+        else None
+    )
     async with open_imcp_session(
         server_path=_bundled_server_path(app_path),
+        client_credential=client_credential,
         client_info=types.Implementation(
             name=CLIENT_NAME,
             version=CLIENT_VERSION,
@@ -130,7 +139,7 @@ Captured from iMCP **{app_version}** on **{capture_date}** using a read-only MCP
 
 The generic full iMCP {app_version} tool surface when all services are enabled is documented below; this is not a record of the operator's Mac configuration.
 
-Supported deployments require iMCP **>=1.5.1**. This probe launches the app's bundled `imcp-server` over stdio and records only tool names, descriptions, and input schemas; no tool is invoked and no tool result or personal data is captured.
+Supported deployments require iMCP **>=1.8.2**. This probe launches the app's bundled `imcp-server` over stdio and records only tool names, descriptions, and input schemas; no tool is invoked and no tool result or personal data is captured.
 
 ```json
 {payload}
@@ -148,6 +157,12 @@ def _parse_args() -> argparse.Namespace:
         help="path to iMCP.app, launched if iMCP is not running",
     )
     parser.add_argument(
+        "--client-credential-file",
+        type=Path,
+        default=None,
+        help="optional private iMCP 1.8.2+ client credential file",
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         default=root / "docs/imcp-tools.md",
@@ -156,7 +171,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--app-version",
         default=APP_VERSION,
-        help="installed iMCP version to record (supported versions are >=1.5.1)",
+        help="installed iMCP version to record (supported versions are >=1.8.2)",
     )
     parser.add_argument(
         "--capture-date",
@@ -177,7 +192,7 @@ async def _run(args: argparse.Namespace) -> None:
 
     try:
         tools = await asyncio.wait_for(
-            _list_all_tools(args.app),
+            _list_all_tools(args.app, args.client_credential_file),
             timeout=args.timeout,
         )
     except asyncio.TimeoutError as exc:

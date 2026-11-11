@@ -261,3 +261,48 @@ for line in sys.stdin:
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ClientCredentialTests(unittest.TestCase):
+    SECRET = "s3cret-credential-value"
+
+    def _file(self, directory: str, mode: int, contents: str | None = None) -> Path:
+        path = Path(directory) / "cred"
+        path.write_text(self.SECRET + "\n" if contents is None else contents, encoding="utf-8")
+        path.chmod(mode)
+        return path
+
+    def test_env_only_when_configured(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = _write_executable(Path(directory), "")
+            self.assertIsNone(transport._server_parameters(path).env)
+            env = transport._server_parameters(path, self.SECRET).env
+            assert env is not None
+            self.assertEqual(env["IMCP_CLIENT_CREDENTIAL"], self.SECRET)
+            for key, value in transport.get_default_environment().items():
+                self.assertEqual(env[key], value)
+
+    def test_loader_accepts_private_file(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = self._file(directory, 0o600)
+            self.assertEqual(transport.load_client_credential(path), self.SECRET)
+            path.chmod(0o400)
+            self.assertEqual(transport.load_client_credential(path), self.SECRET)
+
+    def test_loader_rejects_bad_files_without_leaking(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            cases = [
+                self._file(directory, 0o644),
+                self._file(directory, 0o660),
+                self._file(directory, 0o600, "   \n"),
+                self._file(directory, 0o600, f"{self.SECRET} extra"),
+                Path(directory) / "missing",
+            ]
+            for path in cases:
+                with self.assertRaises(transport.TransportConfigurationError) as caught:
+                    transport.load_client_credential(path)
+                self.assertNotIn(self.SECRET, str(caught.exception))
+            link = Path(directory) / "link"
+            link.symlink_to(self._file(directory, 0o600))
+            with self.assertRaises(transport.TransportConfigurationError):
+                transport.load_client_credential(link)

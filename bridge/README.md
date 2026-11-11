@@ -2,9 +2,11 @@
 
 `server.py` is a macOS-host HTTP boundary around the bundled
 `/Applications/iMCP.app/Contents/MacOS/imcp-server` stdio transport and the
-official Python MCP SDK. It requires iMCP **1.5.1 or newer** and is not
+official Python MCP SDK. It requires iMCP **1.8.2 or newer** and is not
 installed, launched, or registered as a persistent service by this repository.
 The plugin-facing HTTP contract remains independent of this host transport.
+
+Optional `--client-credential-file` (default helper path `~/.config/imcp-client.credential`, mode 0400/0600) supplies the client credential iMCP 1.8.2+ shows after you approve the client with "Always trust this client". The bridge pings a reused session before each request and relaunches `imcp-server` if it exited; it never replays a call.
 
 ## Reproducible setup
 

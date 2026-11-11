@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any, Callable, TypeAlias
 from urllib.parse import urlsplit
 
+import anyio
 from mcp import MCPError, types
 
 # Keep direct execution (``python bridge/server.py``) working without installing
@@ -40,6 +41,8 @@ try:
         DEFAULT_SHUTDOWN_TIMEOUT as DEFAULT_STDIO_SHUTDOWN_TIMEOUT,
         DEFAULT_STARTUP_TIMEOUT,
         MIN_SHUTDOWN_TIMEOUT,
+        TransportConfigurationError,
+        load_client_credential,
         open_imcp_session,
     )
 except ModuleNotFoundError:  # pragma: no cover - only used for direct execution
@@ -51,6 +54,8 @@ except ModuleNotFoundError:  # pragma: no cover - only used for direct execution
         DEFAULT_SHUTDOWN_TIMEOUT as DEFAULT_STDIO_SHUTDOWN_TIMEOUT,
         DEFAULT_STARTUP_TIMEOUT,
         MIN_SHUTDOWN_TIMEOUT,
+        TransportConfigurationError,
+        load_client_credential,
         open_imcp_session,
     )
 
@@ -138,6 +143,21 @@ _TRANSPORT_ERROR_CODES = frozenset(
         types.REQUEST_TIMEOUT,
     }
 )
+
+_DISCONNECT_EXCEPTIONS = (
+    ConnectionError,
+    EOFError,
+    anyio.ClosedResourceError,
+    anyio.BrokenResourceError,
+    anyio.EndOfStream,
+)
+
+
+def _is_confirmed_disconnect(exc: BaseException) -> bool:
+    if isinstance(exc, MCPError):
+        return exc.code == types.CONNECTION_CLOSED
+    return isinstance(exc, _DISCONNECT_EXCEPTIONS)
+
 
 SessionFactory: TypeAlias = Callable[[], Any]
 
@@ -720,6 +740,7 @@ class BridgeService:
         startup_timeout: float = DEFAULT_STARTUP_TIMEOUT,
         setup_timeout: float | None = None,
         shutdown_timeout: float = DEFAULT_SHUTDOWN_TIMEOUT,
+        client_credential: str | None = None,
     ) -> None:
         # ``token`` is accepted for callers that keep auth and service config
         # together, but authentication is enforced by the HTTP handler.  Do
@@ -736,6 +757,7 @@ class BridgeService:
                     raise BridgeConfigurationError("allowlist entries must be valid tool names") from exc
         self._allowlist = entries
         self._server_path = server_path
+        self._client_credential = client_credential
         self._call_timeout = _positive_timeout(call_timeout, label="call timeout")
         self._startup_timeout = _positive_timeout(startup_timeout, label="startup timeout")
         self._setup_timeout = _positive_timeout(
@@ -781,6 +803,7 @@ class BridgeService:
             read_timeout_seconds=self._call_timeout,
             startup_timeout=self._startup_timeout,
             shutdown_timeout=self._shutdown_timeout,
+            client_credential=self._client_credential,
         )
 
     @property
@@ -836,7 +859,11 @@ class BridgeService:
         if self._closing or self._closed:
             raise SessionUnavailableError(app_reachable=False)
         if self._session is not None and not self._session_known_dead:
-            return self._session
+            if await self._session_responds_locked(self._session, deadline):
+                return self._session
+            # imcp-server exits when its iMCP connection ends.  Nothing has
+            # been dispatched yet, so retire it and relaunch for this request.
+            self._session_known_dead = True
 
         # A known-dead session is retired before this new request is
         # dispatched.  This is the only reconnect point in the bridge.
@@ -893,6 +920,27 @@ class BridgeService:
             self._last_app_reachable = owner.entered
             await self._close_session_locked(deadline=self._shutdown_deadline)
             raise SessionUnavailableError(app_reachable=owner.entered) from None
+
+    async def _session_responds_locked(self, session: Any, deadline: float | None) -> bool:
+        """Liveness-check an idle session before dispatching a request to it."""
+
+        send_ping = getattr(session, "send_ping", None)
+        if not callable(send_ping):
+            return True
+        try:
+            timeout = self._bounded_phase_timeout(self._call_timeout, deadline)
+            await _await_bounded(send_ping(), timeout)
+        except asyncio.CancelledError:
+            raise
+        except asyncio.TimeoutError:
+            # Exhausted budget or slow ping is not proof of a disconnect:
+            # keep the session and fail only this request (nothing dispatched).
+            raise SessionUnavailableError(app_reachable=True) from None
+        except Exception as exc:
+            if _is_confirmed_disconnect(exc):
+                return False
+            raise SessionUnavailableError(app_reachable=True) from None
+        return True
 
     async def _mark_session_dead_locked(self) -> None:
         self._session_known_dead = True
@@ -1588,6 +1636,12 @@ class BridgeRequestHandler(BaseHTTPRequestHandler):
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--token-file", type=Path, required=True, help="trusted bearer-token file")
+    parser.add_argument(
+        "--client-credential-file",
+        type=Path,
+        default=None,
+        help="optional private file holding the iMCP 1.8.2+ client credential",
+    )
     parser.add_argument("--bind", default=DEFAULT_BIND, help="HTTP bind address")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="HTTP port")
     parser.add_argument("--path", default=DEFAULT_PATH, help="HTTP bridge path")
@@ -1637,9 +1691,16 @@ def main(argv: list[str] | None = None) -> int:
         _validate_port(args.port)
         bridge_path = _normalize_path(args.path)
         allowlist = frozenset(args.allow_tool) if args.allow_tool is not None else load_allowlist(args.allowlist_file)
+        client_credential = None
+        if args.client_credential_file is not None:
+            try:
+                client_credential = load_client_credential(args.client_credential_file)
+            except TransportConfigurationError as exc:
+                raise BridgeConfigurationError(str(exc)) from None
         service = BridgeService(
             allowlist=allowlist,
             call_timeout=args.call_timeout,
+            client_credential=client_credential,
         )
         runtime = AsyncBridgeRuntime(service)
         runtime.start()

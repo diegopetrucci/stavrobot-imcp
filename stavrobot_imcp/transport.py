@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, TypeAlias
 
 from mcp import ClientSession, types
-from mcp.client.stdio import StdioServerParameters, stdio_client
+from mcp.client.stdio import StdioServerParameters, get_default_environment, stdio_client
 
 DEFAULT_SERVER_PATH = Path("/Applications/iMCP.app/Contents/MacOS/imcp-server")
 DEFAULT_STARTUP_TIMEOUT = 5.0
@@ -83,11 +83,50 @@ def _validate_server_path(value: ServerPath) -> Path:
     return path
 
 
-def _server_parameters(server_path: ServerPath) -> StdioServerParameters:
+CLIENT_CREDENTIAL_ENV = "IMCP_CLIENT_CREDENTIAL"
+
+
+def load_client_credential(path: ServerPath) -> str:
+    """Read an iMCP 1.8.2+ client credential from a private owned file.
+
+    Errors are deliberately generic and never include the file contents.
+    """
+
+    try:
+        flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+        fd = os.open(path, flags)
+        with os.fdopen(fd, "rb") as handle:
+            file_stat = os.fstat(handle.fileno())
+            if (
+                not stat.S_ISREG(file_stat.st_mode)
+                or file_stat.st_uid != os.getuid()
+                or stat.S_IMODE(file_stat.st_mode) not in (0o400, 0o600)
+            ):
+                raise TransportConfigurationError(
+                    "client credential file must be an owned regular file with mode 0400 or 0600"
+                )
+            credential = handle.read().decode("utf-8").strip()
+    except TransportConfigurationError:
+        raise
+    except (OSError, UnicodeError, TypeError, ValueError):
+        raise TransportConfigurationError("client credential file could not be read") from None
+    if not credential or any(character.isspace() for character in credential):
+        raise TransportConfigurationError("client credential file is empty or contains whitespace")
+    return credential
+
+
+def _server_parameters(
+    server_path: ServerPath,
+    client_credential: str | None = None,
+) -> StdioServerParameters:
     """Build SDK launch parameters without invoking a shell."""
 
     path = _validate_server_path(server_path)
-    return StdioServerParameters(command=os.fspath(path), args=[])
+    env = None
+    if client_credential is not None:
+        # An explicit env replaces the SDK's safe default, so start from it.
+        env = {**get_default_environment(), CLIENT_CREDENTIAL_ENV: client_credential}
+    return StdioServerParameters(command=os.fspath(path), args=[], env=env)
 
 
 @asynccontextmanager
@@ -142,6 +181,7 @@ async def open_imcp_session(
     read_timeout_seconds: float | None = None,
     startup_timeout: float = DEFAULT_STARTUP_TIMEOUT,
     shutdown_timeout: float = DEFAULT_SHUTDOWN_TIMEOUT,
+    client_credential: str | None = None,
 ) -> AsyncIterator[ClientSession]:
     """Yield an official SDK ``ClientSession`` connected to bundled iMCP.
 
@@ -160,7 +200,7 @@ async def open_imcp_session(
     if read_timeout_seconds is not None:
         read_timeout_seconds = _validate_timeout(read_timeout_seconds, label="read timeout")
 
-    parameters = _server_parameters(server_path)
+    parameters = _server_parameters(server_path, client_credential)
     transport_context = _stdio_transport(parameters)
     transport_entered = False
     session_context: ClientSession | None = None
