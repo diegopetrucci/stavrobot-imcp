@@ -10,7 +10,7 @@ connect to live iMCP, or verify a Stavrobot deployment.
 The integration has separate host, plugin, and operator boundaries:
 
 ```text
-iMCP app (>=1.5.1; macOS permissions and manual client approval)
+iMCP app (>=1.8.2; macOS permissions and manual client approval)
   -> bundled Contents/MacOS/imcp-server over stdio
   -> bridge/server.py at 127.0.0.1:8766/bridge (authenticated host bridge)
   -> host.docker.internal:8766/bridge (plugin-runner route)
@@ -22,7 +22,7 @@ iMCP app (>=1.5.1; macOS permissions and manual client approval)
   bundled `imcp-server` through the official MCP SDK stdio client. The bridge
   HTTP request/response contract is unchanged; see
   [`bridge/README.md`](bridge/README.md) for its contract and lifecycle.
-- The bundled stdio entrypoint is supported only by iMCP **1.5.1 or newer**:
+- The bundled stdio entrypoint is supported only by iMCP **1.8.2 or newer**:
   `/Applications/iMCP.app/Contents/MacOS/imcp-server` must be executable on the
   host. Do not substitute network discovery or a manually selected TCP port.
 - `plugin/imcp/` contains the `imcp_list_tools` and `imcp_call` Stavrobot

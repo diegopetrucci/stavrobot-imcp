@@ -666,6 +666,57 @@ def test_real_sdk_disconnect_never_replays_and_reconnects_with_fresh_stdio_serve
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("exit_phase", ["idle", "in_flight"])
+def test_real_sdk_server_exit_on_imcp_disconnect_recovers_on_next_call(exit_phase: str) -> None:
+    """imcp-server >= 1.8.2 exits when its iMCP connection ends instead of reconnecting."""
+
+    async def scenario() -> None:
+        first_fixture = FixtureMCPServer(block_calls=exit_phase == "in_flight")
+        second_fixture = FixtureMCPServer()
+        server_paths = ServerSequence([await first_fixture.start(), await second_fixture.start()])
+        service = make_service(server_paths)
+        try:
+            if exit_phase == "idle":
+                warmup = await service.execute({"operation": "list_tools"})
+                assert warmup.payload["ok"] is True
+                assert first_fixture.pid_alive()
+                os.kill(first_fixture.pid, 9)
+                await first_fixture.wait_for_closed()
+                pending = None
+            else:
+                pending = asyncio.create_task(
+                    service.execute(
+                        {"operation": "call_tool", "name": "fixture_tool", "arguments": {"value": "once"}}
+                    )
+                )
+                await first_fixture.call_started.wait()
+                os.kill(first_fixture.pid, 9)
+
+            if pending is not None:
+                failed = await asyncio.wait_for(pending, 5.0)
+                assert failed.payload["ok"] is False
+                assert failed.payload["error"]["code"] == "unknown_outcome"
+                assert failed.payload["error"]["retryable"] is False
+                await first_fixture.wait_for_closed()
+                assert len(first_fixture.call_arguments) == 1
+
+            second = await service.execute(
+                {"operation": "call_tool", "name": "fixture_tool", "arguments": {"value": "later"}}
+            )
+            assert second.payload["ok"] is True
+            assert server_paths.calls == 2
+            assert second_fixture.connection_count == 1
+            assert second_fixture.call_arguments == [{"value": "later"}]
+            assert len(first_fixture.call_arguments) == (1 if pending is not None else 0)
+
+            await service.close()
+            await second_fixture.wait_for_closed()
+        finally:
+            await close_fixture(first_fixture, second_fixture)
+
+    asyncio.run(scenario())
+
+
 def test_real_sdk_initialize_cancellation_closes_owner_and_reconnects() -> None:
     async def scenario() -> None:
         loop_exceptions = install_loop_exception_capture()

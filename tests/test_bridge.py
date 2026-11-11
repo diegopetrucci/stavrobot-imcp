@@ -417,6 +417,94 @@ def test_per_call_timeout_returns_unknown_without_replay() -> None:
     assert time.monotonic() - started < 0.5
 
 
+class PingSession(FakeSession):
+    def __init__(self, ping: Any) -> None:
+        super().__init__()
+        self._ping = ping
+        self.ping_calls = 0
+
+    async def send_ping(self) -> None:
+        self.ping_calls += 1
+        await self._ping()
+
+
+def _ping_service(first: PingSession, **kwargs: Any) -> tuple[BridgeService, list[FakeSessionContext]]:
+    second = FakeSession(tool_text="fresh-session")
+    contexts = [FakeSessionContext(first), FakeSessionContext(second)]
+    created: list[FakeSessionContext] = []
+
+    def factory() -> FakeSessionContext:
+        context = contexts[len(created)]
+        created.append(context)
+        return context
+
+    return BridgeService(session_factory=factory, **kwargs), created
+
+
+CALL = {"operation": "call_tool", "name": "t", "arguments": {}}
+
+
+def test_confirmed_exit_on_ping_relaunches_before_dispatch() -> None:
+    async def dead() -> None:
+        raise ConnectionResetError
+
+    first = PingSession(dead)
+    service, created = _ping_service(first, call_timeout=0.2)
+
+    async def scenario() -> Any:
+        await service.execute(CALL)  # establishes the session
+        return await service.execute(CALL)
+
+    response = run(scenario())
+    assert response.payload["ok"] is True
+    assert len(created) == 2
+    assert len(first.call_calls) == 1
+
+
+def test_slow_ping_keeps_session_and_does_not_replay() -> None:
+    async def slow() -> None:
+        await asyncio.sleep(1)
+
+    first = PingSession(slow)
+    service, created = _ping_service(first, call_timeout=0.05)
+
+    async def scenario() -> tuple[Any, Any]:
+        await service.execute(CALL)
+        return await service.execute(CALL), service._session
+
+    response, session = run(scenario())
+    assert response.status_code == 503
+    assert response.payload["error"]["code"] == "mcp_unavailable"
+    assert session is first
+    assert len(created) == 1
+    assert len(first.call_calls) == 1
+
+
+def test_expired_deadline_keeps_session_without_ping() -> None:
+    async def ok() -> None:
+        return None
+
+    first = PingSession(ok)
+    service, created = _ping_service(first, call_timeout=0.2)
+
+    async def scenario() -> tuple[Any, Any]:
+        await service.execute(CALL)
+        pings = first.ping_calls
+        loop_time = asyncio.get_running_loop().time()
+        async with service._lock:
+            try:
+                await service._ensure_session_locked(deadline=loop_time - 1)
+            except Exception as exc:
+                error = exc
+        return (error, pings), service._session
+
+    (error, pings), session = run(scenario())
+    assert type(error).__name__ == "SessionUnavailableError"
+    assert first.ping_calls == pings
+    assert session is first
+    assert len(created) == 1
+
+
 def test_dead_session_is_not_retried_and_next_call_reconnects() -> None:
     first = FakeSession(call_results=[MCPError(types.CONNECTION_CLOSED, "closed")])
     second = FakeSession(tool_text="fresh-session")
@@ -1294,3 +1382,41 @@ def test_list_tools_paginates_and_rejects_repeated_cursor() -> None:
     assert repeated_response.status_code == 502
     assert repeated_response.payload["error"]["code"] == "invalid_mcp_response"
     assert repeating.list_calls == 2
+
+
+def test_client_credential_reaches_session_factory_only_when_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[dict[str, Any]] = []
+
+    def fake_open(**kwargs: Any) -> object:
+        seen.append(kwargs)
+        return object()
+
+    monkeypatch.setattr("bridge.server.open_imcp_session", fake_open)
+
+    async def build() -> None:
+        BridgeService(client_credential="cred-value")._default_session_factory()
+        BridgeService()._default_session_factory()
+
+    asyncio.run(build())
+    assert seen[0]["client_credential"] == "cred-value"
+    assert seen[1]["client_credential"] is None
+
+
+def test_main_rejects_bad_credential_file_without_leaking(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    token = tmp_path / "token"
+    token.write_text("secret-token\n", encoding="utf-8")
+    credential = tmp_path / "credential"
+    credential.write_text("cred-value-xyz\n", encoding="utf-8")
+    credential.chmod(0o644)
+
+    result = main(["--token-file", str(token), "--allow-tool", "t", "--client-credential-file", str(credential)])
+
+    captured = capsys.readouterr()
+    assert result == 1
+    assert "cred-value-xyz" not in captured.out + captured.err + caplog.text

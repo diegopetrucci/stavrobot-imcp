@@ -155,6 +155,7 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
                 app_version="1.4.1",
                 capture_date="2026-09-07",
                 timeout=1.0,
+                client_credential_file=None,
             )
             with (
                 patch.object(probe_imcp, "_launch_app_if_needed") as launch_app,
@@ -168,7 +169,22 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
                 await probe_imcp._run(args)
 
         launch_app.assert_called_once_with(custom_app)
-        list_all_tools.assert_awaited_once_with(custom_app)
+        list_all_tools.assert_awaited_once_with(custom_app, None)
+
+    async def test_credential_file_is_loaded_and_passed_to_session(self) -> None:
+        fake_context = _FakeSessionContext(_FakeSession())
+        with tempfile.TemporaryDirectory() as directory:
+            credential = Path(directory) / "cred"
+            credential.write_text("probe-secret\n", encoding="utf-8")
+            credential.chmod(0o600)
+            with patch.object(probe_imcp, "open_imcp_session", return_value=fake_context) as open_session:
+                await probe_imcp._list_all_tools(client_credential_file=credential)
+            self.assertEqual(open_session.call_args.kwargs["client_credential"], "probe-secret")
+
+            credential.chmod(0o644)
+            with self.assertRaises(ValueError) as caught:
+                await probe_imcp._list_all_tools(client_credential_file=credential)
+            self.assertNotIn("probe-secret", str(caught.exception))
 
     def test_missing_app_is_a_friendly_failure(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -226,9 +242,10 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
             app_version="1.4.1",
             capture_date="2026-09-07",
             timeout=1.0,
+            client_credential_file=None,
         )
 
-        async def fail_listing(_app_path: Path) -> list[dict[str, object]]:
+        async def fail_listing(_app_path: Path, _credential_file: Path | None) -> list[dict[str, object]]:
             raise RuntimeError("transport unavailable")
 
         stderr = io.StringIO()
@@ -293,7 +310,7 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
             "is documented below; this is not a record of the operator's Mac configuration.",
             rendered,
         )
-        self.assertIn("Supported deployments require iMCP **>=1.5.1**", rendered)
+        self.assertIn("Supported deployments require iMCP **>=1.8.2**", rendered)
         self.assertIn("bundled `imcp-server` over stdio", rendered)
         self.assertIn("no tool is invoked", rendered)
 

@@ -9,7 +9,7 @@ runner compatibility notes, and how to run the tests.
 
 ## Host transport compatibility
 
-The host bridge requires iMCP **1.5.1 or newer** and launches the app's bundled
+The host bridge requires iMCP **1.8.2 or newer** and launches the app's bundled
 `Contents/MacOS/imcp-server` through the official MCP SDK stdio client. The
 plugin runner never launches that process and does not speak stdio; it continues
 to use the authenticated HTTP `POST` contract at `bridge_url` with its Bearer
